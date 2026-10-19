@@ -9,4 +9,3 @@
 | Attack and benign catalogs | not_started | `backend/src/promptfirewall/attacks`, `data` | pending | not run | — |
 | Runner, persistence, and API | not_started | `backend/src/promptfirewall/harness`, `storage`, `api` | pending | not run | — |
 | Judges, metrics, and reports | not_started | `backend/src/promptfirewall/judges`, `metrics`, `reports` | pending | not run | — |
-| React dashboard | not_started | `frontend` | pending | not run | — |
