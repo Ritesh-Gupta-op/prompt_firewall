@@ -1,0 +1,2 @@
+[tool.fastapi]
+entrypoint = "backend/src/promptfirewall/main.py:app"
