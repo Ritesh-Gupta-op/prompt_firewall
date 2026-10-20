@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
+PYTHON ?= $(if $(shell test -x .venv/bin/python && printf yes),.venv/bin/python,python3)
 BOOTSTRAP_PYTHON ?= python3.11
 
 .PHONY: test test-backend setup lint typecheck check format run dev-backend lock build

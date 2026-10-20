@@ -7,7 +7,7 @@ Audit target: clean Linux source checkout, backend-only PromptFirewall.
 | Requirement | Status | Evidence / implementation |
 |---|---|---|
 | Git repository with commits | PASS | Git history contains the implementation and reproducibility commits; working tree is checked before commit. |
-| Dependency lockfile | PASS | `requirements.lock` and `requirements-dev.lock` contain exact pins plus SHA-256 hashes. Runtime pins are shared by the dev lock. |
+| Dependency lockfile | PASS | `requirements.lock` and `requirements-dev.lock` contain exact pins plus SHA-256 hashes. Runtime pins are shared by the dev lock; the root compatibility requirements file delegates to `requirements.lock`. |
 | Runtime pinned | PASS | `.python-version` is exactly `3.11.2`; Docker builder/runtime bases use the same pinned version and digest. |
 | Dockerfile builds and runs | IMPLEMENTED / LOCAL CHECK BLOCKED | Multi-stage builder, offline test target, non-root runtime, healthcheck, locked binary wheels, and Uvicorn default are defined. Docker is unavailable in this environment; CI runs `docker build`, `docker run --network none`, and the HTTP smoke test. |
 | One test command | PASS | `make test` is the single offline test entry point; `make check` adds lint/typecheck. The Docker test target runs the same pytest command. |
@@ -39,6 +39,8 @@ Observed results:
   firewall, and `pip check` smoke tests.
 - `make run`: `/health` passed; a prompt-injection chat returned `blocked: true`;
   the resulting run was persisted and readable through the API.
+- The Makefile ignores an incomplete/broken `.venv` symlink and falls back to the
+  configured system Python; `make setup` refuses to overwrite such an environment.
 
 The source export used only project-relative paths. Dependency wheels were already
 available in the local package cache for this offline verification; a new machine

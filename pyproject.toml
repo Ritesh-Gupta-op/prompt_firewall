@@ -3,15 +3,17 @@ name = "promptfirewall"
 version = "0.1.0"
 description = "Backend prompt firewall with isolated, observable security evaluation"
 requires-python = ">=3.11"
+# The installable package is backend/; this root metadata only supports the
+# optional serverless entry point. Keep versions aligned with requirements.lock.
 dependencies = [
-  "fastapi>=0.115,<1",
-  "uvicorn[standard]>=0.30,<1",
-  "pydantic>=2.8,<3",
-  "pydantic-settings>=2.4,<3",
-  "sqlalchemy[asyncio]>=2.0.30,<3",
-  "aiosqlite>=0.20,<1",
-  "httpx>=0.27,<1",
-  "python-multipart>=0.0.9,<1",
+  "fastapi==0.151.0",
+  "uvicorn[standard]==0.54.0",
+  "pydantic==2.14.1",
+  "pydantic-settings==2.16.1",
+  "sqlalchemy[asyncio]==2.1.5",
+  "aiosqlite==0.22.1",
+  "httpx==0.28.1",
+  "python-multipart==0.0.32",
 ]
 
 [tool.vercel]
