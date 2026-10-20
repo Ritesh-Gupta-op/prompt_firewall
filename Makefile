@@ -1,12 +1,16 @@
 SHELL := /bin/bash
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
+BOOTSTRAP_PYTHON ?= python3.11
 
-.PHONY: test test-backend lint typecheck check format dev-backend lock build
+.PHONY: test test-backend setup lint typecheck check format run dev-backend lock build
 
 test: test-backend
 
 test-backend:
 	$(PYTHON) -m pytest -c backend/pyproject.toml backend/tests -q
+
+setup:
+	$(BOOTSTRAP_PYTHON) scripts/bootstrap.py
 
 lint:
 	$(PYTHON) -m ruff check backend/src backend/tests
@@ -18,6 +22,9 @@ check: test lint typecheck
 
 format:
 	$(PYTHON) -m ruff format backend/src backend/tests
+
+run:
+	$(PYTHON) -m uvicorn promptfirewall.main:app --app-dir backend/src --host 127.0.0.1 --port 8000
 
 dev-backend:
 	$(PYTHON) -m uvicorn promptfirewall.main:app --app-dir backend/src --reload
