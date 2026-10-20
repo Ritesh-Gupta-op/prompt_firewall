@@ -14,7 +14,7 @@ There is no frontend deliverable and no claim of universal injection detection.
 | Metrics and reports | Implemented and tested | Eligible denominators, missing usage, JSON/Markdown evidence; unfinished runs excluded |
 | API access control | Implemented and tested | Configured key covers API/docs/evidence; production rejects missing key |
 | Reproducible local build | Verified from fresh venv | Hash-locked dev/runtime installs, wheel build and installed-wheel smoke |
-| Container deployment | Implemented; not locally executed | Pinned runtime, locked wheel installation, non-root user, loopback Compose, CI build/run checks |
+| Container deployment | Implemented; CI/local execution blocked | Pinned runtime, locked wheel installation, non-root user, loopback Compose, CI build/run checks |
 
 ## Checks actually run
 
@@ -31,6 +31,8 @@ There is no frontend deliverable and no claim of universal injection detection.
   ordered traces, JSON/Markdown reports, metrics unchanged after SQLite restart.
   This is now an offline regression test in
   `backend/tests/integration/test_catalog_persistence.py`.
+- Git-free source export rebuild: `make setup`, `make check`, `make build`,
+  runtime-only wheel install, `pip check`, and `make run` HTTP smoke all passed.
 
 ## Observed synthetic catalog outcomes
 
@@ -51,5 +53,6 @@ prompt hardening, and mandatory tool controls are identical in `none` and
 ## Deployment checks still external
 
 Docker is unavailable in the current container, so no successful Docker build/run
-is claimed. No live provider request was made. Remaining scope boundaries are
+is claimed here. CI contains the Docker build/test-target/run and HTTP smoke checks.
+No live provider request was made. Remaining scope boundaries are
 documented in `KNOWN_LIMITATIONS.md`, not hidden as completed verification.

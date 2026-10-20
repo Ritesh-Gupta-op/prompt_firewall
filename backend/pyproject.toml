@@ -59,3 +59,6 @@ mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
 
 [tool.fastapi]
 entrypoint = "promptfirewall.main:app"
+
+[tool.vercel]
+entrypoint = "promptfirewall.main:app"
