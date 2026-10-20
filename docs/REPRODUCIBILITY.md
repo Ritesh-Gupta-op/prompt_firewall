@@ -13,7 +13,7 @@ Audit target: clean Linux source checkout, backend-only PromptFirewall.
 | One test command | PASS | `make test` is the single offline test entry point; `make check` adds lint/typecheck. The Docker test target runs the same pytest command. |
 | README setup/run/test steps | PASS | Root `README.md` has Docker-only and local Python setup, test, build, run, Compose, shutdown, and API commands. |
 | `.env.example`, no secrets | PASS | `.env.example` documents canonical settings with mock/local safe defaults and placeholders. Private `.env`/`.env.*` are ignored and excluded from Docker. |
-| No machine absolute paths | PASS | Repository scan found no `/home/`, `/Users/`, or Windows-user paths in tracked project files. Paths are derived from source locations or are container/project-relative. |
+| No machine absolute paths | PASS | Repository scan found no host-user or Windows-user paths in tracked project files. Paths are derived from source locations or are container/project-relative. |
 
 ## Clean-source verification performed
 
