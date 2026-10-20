@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ExperimentStatus(StrEnum):
@@ -27,7 +27,9 @@ class ExperimentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     attack_ids: list[str] = Field(default_factory=list)
     benign_case_ids: list[str] = Field(default_factory=list)
-    defense_profile_ids: list[str] = Field(default_factory=lambda: ["none", "full-stack"])
+    defense_profile_ids: list[str] = Field(
+        default_factory=lambda: ["none", "full-stack"], min_length=1
+    )
     model_provider: str = "mock"
     model_name: str = "promptfirewall-mock-1"
     repetitions: int = Field(default=1, ge=1, le=20)
@@ -39,8 +41,25 @@ class ExperimentCreate(BaseModel):
     defense_config_version: str = "defense-v1"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("defense_profile_ids")
+    @classmethod
+    def normalize_profiles(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip().casefold().replace("_", "-") for value in values]
+        if any(not value for value in normalized):
+            raise ValueError("defense profile IDs must be non-empty")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("defense profile IDs must be unique after normalization")
+        return normalized
+
+    @field_validator("model_provider", "model_name")
+    @classmethod
+    def nonempty_model_setting(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("model provider and name must be non-empty")
+        return value.strip()
+
     @model_validator(mode="after")
-    def has_cases(self) -> "ExperimentCreate":
+    def has_cases(self) -> ExperimentCreate:
         if not self.attack_ids and not self.benign_case_ids:
             raise ValueError("select at least one attack or benign case")
         return self

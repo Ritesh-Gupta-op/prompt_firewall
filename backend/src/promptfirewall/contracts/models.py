@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,7 +20,8 @@ class ModelMessage(BaseModel):
 class ToolDefinition(BaseModel):
     name: str
     description: str
-    parameters: dict[str, Any] = Field(default_factory=dict)
+    # Provider-facing JSON Schema, not a mapping of argument names to type strings.
+    parameters: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
 
 
 class ModelRequest(BaseModel):
@@ -53,6 +54,16 @@ class ModelResponse(BaseModel):
     is_mock: bool = False
 
 
+@runtime_checkable
+class SyncModel(Protocol):
+    """Synchronous model seam shared by the victim, runner, and provider bridge."""
+
+    @property
+    def model_name(self) -> str: ...
+
+    def complete(self, request: ModelRequest) -> ModelResponse: ...
+
+
 class TestIdentity(BaseModel):
     user_id: str
     role: UserRole
@@ -69,7 +80,9 @@ class ToolResult(BaseModel):
 
 
 class RunConfig(BaseModel):
-    identity: TestIdentity = TestIdentity(user_id="demo-customer", role=UserRole.CUSTOMER, customer_id="cust-1001")
+    identity: TestIdentity = TestIdentity(
+        user_id="demo-customer", role=UserRole.CUSTOMER, customer_id="cust-1001"
+    )
     model_provider: str = "mock"
     model_name: str = "promptfirewall-mock-1"
     temperature: float = Field(default=0.0, ge=0, le=2)

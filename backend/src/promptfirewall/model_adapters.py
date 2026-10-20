@@ -13,10 +13,13 @@ from promptfirewall.adapters import (
     MockAdapter,
     ModelAdapter,
     OpenAICompatibleAdapter,
+    ProviderSyncModel,
     classify_adapter_error,
     create_model_adapter,
+    create_sync_model,
     get_model_adapter,
 )
+from promptfirewall.contracts.models import SyncModel
 
 __all__ = [
     "AdapterAuthenticationError",
@@ -31,7 +34,10 @@ __all__ = [
     "MockAdapter",
     "ModelAdapter",
     "OpenAICompatibleAdapter",
+    "ProviderSyncModel",
+    "SyncModel",
     "classify_adapter_error",
     "create_model_adapter",
+    "create_sync_model",
     "get_model_adapter",
 ]

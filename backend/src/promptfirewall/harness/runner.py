@@ -4,36 +4,30 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from pathlib import Path
 from threading import Event
 from typing import Any
 
 from promptfirewall.attacks.registry import get_attack, get_benign_case
-from promptfirewall.contracts.attacks import AttackDefinition, BenignCase, CaseKind
-from promptfirewall.contracts.defenses import (
-    DefenseAction,
-    DefenseContext,
-    DefenseDecision,
-)
+from promptfirewall.contracts.attacks import AttackDefinition, BenignCase, CaseKind, DeliveryMode
 from promptfirewall.contracts.experiments import (
     ExperimentCreate,
     ExperimentStatus,
     RunStatus,
 )
 from promptfirewall.contracts.models import (
-    ModelResponse,
-    ProposedToolCall,
+    ModelMessage,
     RunConfig,
+    SyncModel,
     TestIdentity,
-    ToolResult,
     UserRole,
 )
 from promptfirewall.contracts.results import JudgeResult, JudgeStatus, OutcomeLabel
 from promptfirewall.contracts.traces import TraceEvent, TraceEventType
+from promptfirewall.defenses.execution import DefenseBlockedError, EnforcedRun, RunBudget
 from promptfirewall.defenses.pipeline import DefensePipeline
 from promptfirewall.defenses.registry import DEFAULT_REGISTRY, DefenseRegistry
 from promptfirewall.harness.isolation import IsolationFactory
@@ -53,11 +47,10 @@ from promptfirewall.judges.state_change import StateChangeJudge
 from promptfirewall.judges.tool_misuse import ToolMisuseJudge
 from promptfirewall.judges.utility import UtilityJudge
 from promptfirewall.metrics import calculate_metrics
-from promptfirewall.victim_app.fixtures import DEFAULT_FIXTURES
+from promptfirewall.victim_app.fixtures import SyntheticDocument
 from promptfirewall.victim_app.model import DeterministicMockModel
-from promptfirewall.victim_app.rag import KeywordRetriever, RetrievalResult
+from promptfirewall.victim_app.rag import RetrievalResult
 from promptfirewall.victim_app.service import VictimRunResult, VictimService
-from promptfirewall.victim_app.tools import SandboxedMockTools
 
 TraceSink = Callable[[TraceEvent], object]
 RunIdFactory = Callable[[], str]
@@ -93,173 +86,6 @@ class RunSpec:
     def category(self) -> str | None:
         category = getattr(self.case, "category", None)
         return getattr(category, "value", category)
-
-
-@dataclass
-class _ExecutionControl:
-    blocked: bool = False
-    block_reason: str | None = None
-
-
-class _DefendedRetriever:
-    """Apply the configured context defense without changing the victim API."""
-
-    def __init__(
-        self,
-        base: KeywordRetriever,
-        pipeline: DefensePipeline,
-        context: DefenseContext,
-        emit_decision: Callable[[DefenseDecision, str | None], None],
-    ) -> None:
-        self.base = base
-        self.pipeline = pipeline
-        self.context = context
-        self.emit_decision = emit_decision
-
-    def retrieve(
-        self,
-        query: str,
-        *,
-        tenant_id: str | None = None,
-        identity: TestIdentity | None = None,
-        limit: int = 3,
-    ) -> tuple[RetrievalResult, ...]:
-        retrieved = self.base.retrieve(query, tenant_id=tenant_id, identity=identity, limit=limit)
-        result = self.pipeline.process_context(retrieved, self.context)
-        for decision in result.decisions:
-            self.emit_decision(decision, None)
-        if result.blocked:
-            return ()
-        content = result.payload.content
-        if not isinstance(content, (tuple, list)):
-            return ()
-        return tuple(item for item in content if isinstance(item, RetrievalResult))
-
-
-class _DefendedTools:
-    """Apply host-side profile decisions before delegating to mock tools."""
-
-    def __init__(
-        self,
-        base: SandboxedMockTools,
-        pipeline: DefensePipeline,
-        context: DefenseContext,
-        control: _ExecutionControl,
-        emit_decision: Callable[[DefenseDecision, str | None], None],
-    ) -> None:
-        self.base = base
-        self.pipeline = pipeline
-        self.context = context
-        self.control = control
-        self.emit_decision = emit_decision
-
-    def tool_definitions(self) -> tuple[Any, ...]:
-        return self.base.tool_definitions()
-
-    def execute(
-        self,
-        call: ProposedToolCall | str,
-        arguments: dict[str, Any] | None = None,
-        *,
-        identity: TestIdentity,
-        run_id: str,
-        trusted: bool = False,
-    ) -> ToolResult:
-        actual_call = call
-        if isinstance(call, str):
-            actual_call = ProposedToolCall(
-                name=call,
-                arguments=arguments or {},
-                call_id=f"{run_id}-tool-policy",
-            )
-        context = self.context.model_copy(
-            update={
-                "identity": identity.model_dump(mode="json"),
-                "trusted": trusted,
-            }
-        )
-        result = self.pipeline.authorize_tool(actual_call, context)
-        for decision in result.decisions:
-            self.emit_decision(decision, getattr(actual_call, "name", None))
-        if result.blocked:
-            decision = result.last_decision
-            reason = decision.reason_code if decision is not None else "tool_blocked"
-            return ToolResult(
-                success=False,
-                tool_name=getattr(actual_call, "name", "unknown"),
-                error_code=reason,
-                message="tool call blocked by the active defense profile",
-            )
-        if not isinstance(actual_call, ProposedToolCall):
-            return ToolResult(
-                success=False,
-                tool_name="unknown",
-                error_code="invalid_tool_call",
-                message="tool call did not satisfy the shared contract",
-            )
-        return self.base.execute(
-            actual_call,
-            identity=identity,
-            run_id=run_id,
-            trusted=trusted,
-        )
-
-    def refund_ledger(self, run_id: str) -> tuple[Any, ...]:
-        return self.base.refund_ledger(run_id)
-
-    def clear_run(self, run_id: str) -> None:
-        self.base.clear_run(run_id)
-
-    @property
-    def sandbox_root(self) -> Path:
-        return self.base.sandbox_root
-
-
-class _DefendedModel:
-    """Wrap the deterministic model at prompt and output boundaries."""
-
-    def __init__(
-        self,
-        base: DeterministicMockModel,
-        pipeline: DefensePipeline,
-        context: DefenseContext,
-        control: _ExecutionControl,
-        emit_decision: Callable[[DefenseDecision, str | None], None],
-    ) -> None:
-        self.base = base
-        self.pipeline = pipeline
-        self.context = context
-        self.control = control
-        self.emit_decision = emit_decision
-
-    @property
-    def model_name(self) -> str:
-        return self.base.model_name
-
-    def complete(self, request: Any) -> ModelResponse:
-        prompt_result = self.pipeline.process_prompt(request, self.context)
-        for decision in prompt_result.decisions:
-            self.emit_decision(decision, None)
-        if prompt_result.blocked:
-            self.control.blocked = True
-            self.control.block_reason = "prompt_blocked"
-            raise DefenseBlockedError("prompt blocked by defense profile")
-        model_request = prompt_result.payload.content
-        response = self.base.complete(model_request)
-        output_result = self.pipeline.scan_output(response.model_copy(deep=True), self.context)
-        for decision in output_result.decisions:
-            self.emit_decision(decision, None)
-        if output_result.blocked:
-            self.control.blocked = True
-            self.control.block_reason = "output_blocked"
-            return response.model_copy(update={"text": "", "finish_reason": "content_filter"})
-        if isinstance(output_result.payload.content, ModelResponse):
-            return output_result.payload.content
-        return response
-
-
-class DefenseBlockedError(HarnessError):
-    """Internal control-flow exception for a prompt defense block."""
 
 
 class SuccessCriteriaJudge:
@@ -382,7 +208,7 @@ class ExperimentRunner:
             RunSpec(
                 case=case,
                 case_kind=kind,
-                profile_id=profile_id,
+                profile_id=self.defense_registry.get_profile(profile_id).id,
                 repetition_index=repetition,
                 seed=request.random_seed + repetition,
             )
@@ -475,26 +301,26 @@ class ExperimentRunner:
             attack_ids=[record.case_id] if record.case_kind == CaseKind.ATTACK.value else [],
             benign_case_ids=[record.case_id] if record.case_kind == CaseKind.BENIGN.value else [],
             defense_profile_ids=[record.defense_profile_id],
-            model_provider="mock",
+            model_provider=record.metadata.get("model_provider", "mock"),
             model_name=(
-                record.model_response.model
-                if record.model_response is not None
-                else "promptfirewall-mock-1"
+                record.metadata.get("model_name")
+                or (record.model_response.model if record.model_response is not None
+                    else "promptfirewall-mock-1")
             ),
             repetitions=1,
-            random_seed=record.seed - record.repetition_index,
+            random_seed=record.seed,
             concurrency_limit=1,
+            timeout_seconds=record.metadata.get("timeout_seconds", 10.0),
+            token_budget=record.metadata.get("token_budget", 700),
+            metadata=record.metadata.get("request_metadata", {}),
         )
         replayed = self.run(request)
         result = replayed.runs[0]
         result.metadata["replayed_from"] = record.id
+        self._save_run(result)
         return result
 
     def _validate_request(self, request: ExperimentCreate) -> None:
-        if request.model_provider.casefold() != "mock":
-            raise ExperimentValidationError(
-                f"unsupported model provider for local harness: {request.model_provider}"
-            )
         all_case_ids = [*request.attack_ids, *request.benign_case_ids]
         if len(all_case_ids) != len(set(all_case_ids)):
             raise ExperimentValidationError(
@@ -552,22 +378,14 @@ class ExperimentRunner:
         self._save_run(record)
         started = time.perf_counter()
         events: list[TraceEvent] = []
-        control = _ExecutionControl()
-        identity = self._identity_for(spec.case, request)
-        context = DefenseContext(
-            run_id=record.id,
-            correlation_id=record.id,
-            identity=identity.model_dump(mode="json"),
-            metadata={
-                "experiment_id": record.experiment_id,
-                "case_id": record.case_id,
-                "case_kind": record.case_kind,
-                "defense_profile_id": record.defense_profile_id,
-                "seed": record.seed,
-            },
-        )
-        pipeline = DefensePipeline(record.defense_profile_id, registry=self.defense_registry)
-        message = self._message_for(spec.case)
+        record.metadata.update({
+            "model_provider": request.model_provider,
+            "model_name": request.model_name,
+            "timeout_seconds": request.timeout_seconds,
+            "token_budget": request.token_budget,
+            "request_metadata": request.metadata,
+        })
+        budget = RunBudget(request.timeout_seconds, request.token_budget, record.seed)
         self._emit(
             events,
             record,
@@ -575,137 +393,117 @@ class ExperimentRunner:
             "run",
             {"case_id": record.case_id, "case_kind": record.case_kind},
         )
-        self._emit(
-            events,
-            record,
-            TraceEventType.SESSION_INITIALIZED,
-            "session",
-            {"session_id": f"session-{record.id}"},
-        )
-        self._emit(
-            events,
-            record,
-            TraceEventType.ATTACK_DELIVERED,
-            "delivery",
-            {
-                "delivery": getattr(spec.case, "delivery", "user_message"),
-                "message_length": len(message),
-            },
-        )
         try:
-            input_result = pipeline.process_input(message, context)
-            self._emit_decisions(events, record, input_result.decisions)
-            if input_result.blocked:
-                control.blocked = True
-                control.block_reason = (
-                    input_result.last_decision.reason_code
-                    if input_result.last_decision
-                    else "input_blocked"
-                )
-                self._emit(
-                    events,
-                    record,
-                    TraceEventType.INPUT_EVALUATED,
-                    "input",
-                    {"accepted": False, "reason": control.block_reason},
-                )
-                self._complete_blocked(
-                    record,
-                    spec,
-                    control,
-                    events,
-                    request,
-                    started,
-                )
-                return record
-            self._emit(
-                events,
-                record,
-                TraceEventType.INPUT_EVALUATED,
-                "input",
-                {
-                    "accepted": True,
-                    "sanitized": input_result.sanitized,
-                    "text_length": len(str(input_result.payload.content)),
-                },
-            )
-            effective_message = input_result.payload.content
-            if not isinstance(effective_message, str):
-                raise HarnessError("input defense returned non-string content")
-
-            def emit_decision(decision: DefenseDecision, tool_name: str | None) -> None:
-                self._emit_decision(events, record, decision, tool_name=tool_name)
-
-            base_retriever = KeywordRetriever(DEFAULT_FIXTURES)
-            defended_retriever = _DefendedRetriever(
-                base_retriever,
-                pipeline,
-                context,
-                emit_decision,
-            )
-            base_model = DeterministicMockModel(seed=record.seed, model_name=request.model_name)
-            defended_model = _DefendedModel(
-                base_model,
-                pipeline,
-                context,
-                control,
-                emit_decision,
-            )
-            isolated = self.isolation_factory.create(
-                record.id,
-                model=defended_model,
-                retriever=defended_retriever,
-                trace_callback=events.append,
-            )
+            identity = self._identity_for(spec.case, request)
+            model = self._model_for(request, record.seed)
+            isolated = self.isolation_factory.create(record.id, model=model)
             try:
-                isolated.service.tools = _DefendedTools(
-                    isolated.service.tools,
-                    pipeline,
-                    context,
-                    control,
-                    emit_decision,
+                execution = EnforcedRun(
+                    isolated.service,
+                    DefensePipeline(record.defense_profile_id, registry=self.defense_registry),
+                    identity, run_id=record.id,
+                    session_id=str(request.metadata.get("session_id", "session-default")),
+                    budget=budget,
                 )
                 record.state_before = _state_snapshot(
-                    isolated.service, record.id, f"session-{record.id}"
+                    execution.service, record.id, execution.session_id
                 )
-                victim_result = isolated.service.run(
-                    effective_message,
-                    identity,
-                    session_id=f"session-{record.id}",
-                    run_id=record.id,
-                    trace_callback=events.append,
-                )
-                record.model_response = victim_result.model_response
-                record.response_text = victim_result.text
-                record.tool_results = victim_result.tool_results
-                record.state_after = _state_snapshot(
-                    isolated.service, record.id, f"session-{record.id}"
-                )
-                record.blocked = control.blocked
-                record.trace_events = tuple(events)
-                record.evidence["defense_block_reason"] = control.block_reason
-                self._finish_with_judges(record, spec, victim_result, events, started)
+                turns: list[VictimRunResult] = []
+                try:
+                    messages = self._deliver(spec.case, execution)
+                    for turn_index, message in enumerate(messages):
+                        if cancellation.cancelled:
+                            raise HarnessError("cancellation requested during run")
+                        execution.emit(TraceEventType.ATTACK_DELIVERED, "delivery", {
+                            "delivery": getattr(spec.case, "delivery", "user_message"),
+                            "turn_index": turn_index,
+                            "message_length": len(message),
+                        })
+                        turns.append(execution.run_turn(message))
+                        record.model_response = turns[-1].model_response
+                        record.response_text = "\n".join(turn.text for turn in turns)
+                        record.tool_results = tuple(
+                            tool for turn in turns for tool in turn.tool_results
+                        )
+                        if execution.blocked:
+                            break
+                finally:
+                    # Preserve earlier turns and decisions even if a later call
+                    # times out. Execution errors are never attack-success labels.
+                    record.blocked = execution.blocked
+                    record.evidence.update({
+                        "defense_block_reason": execution.block_reason,
+                        "defense_decisions": [
+                            item.model_dump(mode="json") for item in execution.decisions
+                        ],
+                        "turn_count": len(turns),
+                        "access_denials": [
+                            denial for turn in turns for denial in turn.access_denials
+                        ],
+                    })
+                    record.state_after = _state_snapshot(
+                        execution.service, record.id, execution.session_id
+                    )
+                    events.extend(event for event in execution.events
+                                  if event.event_type is not TraceEventType.RUN_STARTED)
+                    record.trace_events = tuple(events)
+                self._finish_with_judges(record, spec, events, started)
             finally:
                 isolated.close()
-        except DefenseBlockedError as error:
-            control.blocked = True
-            control.block_reason = str(error)
-            self._complete_blocked(record, spec, control, events, request, started)
         except Exception as error:
             self._fail_record(record, error, events, started)
         return record
+
+    @staticmethod
+    def _model_for(request: ExperimentCreate, seed: int) -> SyncModel:
+        if request.model_provider.casefold() == "mock":
+            return DeterministicMockModel(seed=seed, model_name=request.model_name)
+        # Optional provider dependencies and credentials are resolved only when
+        # explicitly requested. Import/configuration/provider errors fail the run.
+        from promptfirewall.adapters.bridge import create_sync_model
+
+        return create_sync_model(
+            provider=request.model_provider, model_name=request.model_name, seed=seed,
+        )
+
+    @staticmethod
+    def _deliver(case: AttackDefinition | BenignCase, execution: EnforcedRun) -> tuple[str, ...]:
+        if isinstance(case, BenignCase):
+            return (case.request,)
+        if case.delivery is DeliveryMode.USER_MESSAGE:
+            return tuple(case.turns) or (case.payload_template,)
+        if case.delivery is DeliveryMode.RAG_DOCUMENT:
+            document = SyntheticDocument(
+                document_id=f"catalog-{case.id}", tenant_id=execution.identity.tenant_id,
+                title="Synthetic retrieved attachment", content=case.payload_template,
+                keywords=("support",), trusted=False,
+            )
+            execution.injected_documents = (RetrievalResult(
+                document=document, score=1, matched_keywords=("support",),
+            ),)
+        elif case.delivery is DeliveryMode.TOOL_OUTPUT:
+            execution.injected_messages = (
+                ModelMessage(role="tool", content=case.payload_template),
+            )
+        elif case.delivery is DeliveryMode.CONVERSATION_MEMORY:
+            execution.deliver_memory(case.payload_template)
+        else:
+            raise ExperimentValidationError(f"unsupported delivery: {case.delivery}")
+        return ("Summarize the available support information for my request.",)
 
     def _finish_with_judges(
         self,
         record: RunRecord,
         spec: RunSpec,
-        victim_result: VictimRunResult,
         events: list[TraceEvent],
         started: float,
     ) -> None:
+        if isinstance(spec.case, BenignCase) and spec.case.expectations is not None:
+            record.evidence["benign_expectations"] = spec.case.expectations.model_dump(mode="json")
+            record.evidence["benign_request"] = spec.case.request
         judges = self._judges_for(spec)
         judge_results = [judge.evaluate(record) for judge in judges]
-        if spec.case_kind is CaseKind.ATTACK:
+        if isinstance(spec.case, AttackDefinition):
             criteria_result = SuccessCriteriaJudge().evaluate(record, spec.case.success_criteria)
             judge_results.append(criteria_result)
         aggregate = JudgeAggregator().aggregate(judge_results, case_kind=spec.case_kind.value)
@@ -714,14 +512,15 @@ class ExperimentRunner:
         record.aggregated_judgment = aggregate
         record.outcome = aggregate.outcome
         record.evidence = {
+            **record.evidence,
             **aggregate.evidence,
             "judges": {
                 result.judge_id: result.evidence for result in judge_results
             },
             "observed": {
-                "response_text": victim_result.text,
+                "response_text": record.response_text,
                 "tool_results": [
-                    result.model_dump(mode="json") for result in victim_result.tool_results
+                    result.model_dump(mode="json") for result in record.tool_results
                 ],
             },
         }
@@ -743,66 +542,8 @@ class ExperimentRunner:
         self._finish_trace(record, events, TraceEventType.RUN_COMPLETED, {"success": True})
         self._save_run(record)
 
-    def _complete_blocked(
-        self,
-        record: RunRecord,
-        spec: RunSpec,
-        control: _ExecutionControl,
-        events: list[TraceEvent],
-        request: ExperimentCreate,
-        started: float,
-    ) -> None:
-        del request
-        if spec.case_kind is CaseKind.BENIGN:
-            judge_results = [
-                JudgeResult(
-                    judge_id="utility",
-                    status=JudgeStatus.FAIL,
-                    evidence={"blocked": True, "reason": control.block_reason},
-                    reason_code="benign_request_blocked",
-                    severity="medium",
-                    confidence=1.0,
-                    execution_time_ms=0.0,
-                )
-            ]
-        else:
-            judge_results = [
-                JudgeResult(
-                    judge_id="defense",
-                    status=JudgeStatus.PASS,
-                    evidence={"blocked": True, "reason": control.block_reason},
-                    reason_code="attack_blocked_by_defense",
-                    confidence=1.0,
-                    execution_time_ms=0.0,
-                )
-            ]
-        aggregate = JudgeAggregator().aggregate(judge_results, case_kind=spec.case_kind.value)
-        record.judge_results = tuple(judge_results)
-        record.aggregated_judgment = aggregate
-        record.outcome = aggregate.outcome
-        record.blocked = True
-        record.evidence = {
-            **aggregate.evidence,
-            "blocked": True,
-            "block_reason": control.block_reason,
-            "judges": {result.judge_id: result.evidence for result in judge_results},
-        }
-        for result in judge_results:
-            self._emit(
-                events,
-                record,
-                TraceEventType.JUDGE_COMPLETED,
-                "judge",
-                {"judge_id": result.judge_id, "status": result.status.value},
-            )
-        record.latency_ms = (time.perf_counter() - started) * 1000
-        record.status = RunStatus.COMPLETED
-        record.finished_at = utc_now()
-        self._finish_trace(record, events, TraceEventType.RUN_COMPLETED, {"blocked": True})
-        self._save_run(record)
-
     def _judges_for(self, spec: RunSpec) -> list[Any]:
-        if spec.case_kind is CaseKind.BENIGN:
+        if isinstance(spec.case, BenignCase):
             return [UtilityJudge()]
         values = [
             criterion.value
@@ -840,12 +581,6 @@ class ExperimentRunner:
             model_name=request.model_name,
             seed=request.random_seed,
         ).identity
-
-    @staticmethod
-    def _message_for(case: AttackDefinition | BenignCase) -> str:
-        if isinstance(case, AttackDefinition):
-            return case.payload_template
-        return case.request
 
     def _cancelled_record(
         self,
@@ -899,7 +634,7 @@ class ExperimentRunner:
         record.error = {"type": type(error).__name__, "message": str(error)}
         record.latency_ms = (time.perf_counter() - started) * 1000
         record.finished_at = utc_now()
-        record.evidence = {"error": record.error}
+        record.evidence = {**record.evidence, "error": record.error}
         self._finish_trace(record, events, TraceEventType.RUN_FAILED, {}, error=record.error)
         self._save_run(record)
 
@@ -926,50 +661,6 @@ class ExperimentRunner:
         payload: dict[str, Any],
     ) -> None:
         events.append(self._event(record, event_type, stage, payload))
-
-    def _emit_decisions(
-        self,
-        events: list[TraceEvent],
-        record: RunRecord,
-        decisions: Iterable[DefenseDecision],
-    ) -> None:
-        for decision in decisions:
-            self._emit_decision(events, record, decision)
-
-    def _emit_decision(
-        self,
-        events: list[TraceEvent],
-        record: RunRecord,
-        decision: DefenseDecision,
-        *,
-        tool_name: str | None = None,
-    ) -> None:
-        stage = decision.stage.value
-        event_type = {
-            "input": TraceEventType.INPUT_EVALUATED,
-            "context": TraceEventType.CONTEXT_FILTERED,
-            "prompt": TraceEventType.MODEL_INVOKED,
-            "tool": TraceEventType.TOOL_DENIED
-            if decision.action is DefenseAction.BLOCK
-            else TraceEventType.TOOL_AUTHORIZED,
-            "output": TraceEventType.OUTPUT_EVALUATED,
-        }.get(stage, TraceEventType.OUTPUT_EVALUATED)
-        self._emit(
-            events,
-            record,
-            event_type,
-            stage,
-            {
-                "defense_id": decision.defense_id,
-                "action": decision.action.value,
-                "reason_code": decision.reason_code,
-                "metadata": decision.metadata,
-            },
-        )
-        if events:
-            events[-1] = events[-1].model_copy(
-                update={"defense_id": decision.defense_id, "tool_name": tool_name}
-            )
 
     def _event(
         self,
@@ -1036,10 +727,10 @@ class ExperimentRunner:
 
 
 def _as_experiment(value: ExperimentCreate | dict[str, Any]) -> ExperimentCreate:
-    if isinstance(value, ExperimentCreate):
-        return value
     try:
-        return ExperimentCreate.model_validate(value)
+        return ExperimentCreate.model_validate(
+            value.model_dump() if isinstance(value, ExperimentCreate) else value
+        )
     except Exception as error:
         raise ExperimentValidationError(str(error)) from error
 
@@ -1060,7 +751,7 @@ def _field(value: Any, name: str, default: Any = None) -> Any:
 
 def _event_type(event: Any) -> str:
     value = _field(event, "event_type", "")
-    return getattr(value, "value", value)
+    return str(getattr(value, "value", value))
 
 
 def _adjust_attack_outcome(

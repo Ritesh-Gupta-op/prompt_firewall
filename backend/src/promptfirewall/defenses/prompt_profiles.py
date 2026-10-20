@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Any
 
 from promptfirewall.contracts.defenses import (
     DefenseAction,
@@ -55,6 +56,7 @@ class PromptProfile(Defense):
     def evaluate(self, payload: DefensePayload, context: DefenseContext) -> DefenseDecision:
         del context
         content = payload.content
+        updated: Any
         if isinstance(content, ModelRequest):
             updated_prompt = build_prompt(content.system_instructions, mode=self.mode)
             updated = content.model_copy(update={"system_instructions": updated_prompt})

@@ -14,6 +14,7 @@ from promptfirewall.contracts.defenses import (
     DefenseProfile,
 )
 from promptfirewall.defenses.registry import DEFAULT_REGISTRY, DefenseRegistry
+from promptfirewall.defenses.tool_policy import ToolPolicy
 
 
 @dataclass(frozen=True)
@@ -58,7 +59,7 @@ class DefensePipeline:
             try:
                 defenses = (*defenses, registry.get("tool-policy"))
             except KeyError:
-                pass
+                defenses = (*defenses, ToolPolicy())
         self._defenses = defenses
 
     @property
@@ -80,9 +81,11 @@ class DefensePipeline:
             if not _applies(defense.defense_id, current.kind):
                 continue
             decision = defense.evaluate(current, context)
-            decisions.append(decision)
             if decision.payload is not None:
                 current = decision.payload
+            # Transformations remain internal. Public decisions describe actions,
+            # never prompts, user payloads, tool arguments, or rejected output.
+            decisions.append(decision.model_copy(update={"payload": None}))
             if decision.action is DefenseAction.BLOCK:
                 break
         return PipelineResult(payload=current, decisions=tuple(decisions))

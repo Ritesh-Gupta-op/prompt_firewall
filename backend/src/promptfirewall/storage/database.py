@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.ext.asyncio import create_async_engine as _create
 
@@ -20,7 +22,12 @@ def create_session_factory(
 ) -> async_sessionmaker[AsyncSession]:
     """Create an explicit session factory for dependency injection and tests."""
 
-    return async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    # SQLite in-memory engines share one connection. Serialize repository transactions
+    # (including reads) so concurrent HTTP requests and runner writes cannot interleave.
+    return async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False,
+        info={"storage_lock": asyncio.Lock()},
+    )
 
 
 __all__ = ["create_async_engine", "create_session_factory"]

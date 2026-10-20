@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "promptfirewall"
 version = "0.1.0"
-description = "Offline-first LLM application security benchmarking platform"
+description = "Backend prompt firewall with isolated, observable security evaluation"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115,<1",
@@ -26,6 +26,10 @@ dev = [
   "ruff>=0.6,<1",
   "mypy>=1.11,<2",
   "types-requests>=2.32,<3",
+  "pip-tools==7.5.1",
+  "pip==25.2",
+  "setuptools==80.9.0",
+  "wheel==0.45.1",
 ]
 
 [tool.setuptools.packages.find]
@@ -48,4 +52,4 @@ select = ["E", "F", "I", "B", "UP"]
 python_version = "3.11"
 strict = true
 ignore_missing_imports = true
-mypy_path = "src"
+mypy_path = "$MYPY_CONFIG_FILE_DIR/src"

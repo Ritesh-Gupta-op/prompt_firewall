@@ -6,8 +6,10 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
-from promptfirewall.victim_app.model import DeterministicMockModel
+from promptfirewall.contracts.models import SyncModel
+from promptfirewall.victim_app.rag import KeywordRetriever
 from promptfirewall.victim_app.service import TraceCallback, VictimService
 from promptfirewall.victim_app.tools import SandboxedMockTools
 
@@ -45,7 +47,7 @@ class IsolationFactory:
         self,
         run_id: str,
         *,
-        model: DeterministicMockModel | object | None = None,
+        model: SyncModel | None = None,
         retriever: object | None = None,
         tools: object | None = None,
         trace_callback: TraceCallback | None = None,
@@ -54,12 +56,18 @@ class IsolationFactory:
             raise ValueError("run_id must be non-empty")
         if self.victim_factory is not None:
             service = self.victim_factory()
+            if model is not None:
+                service.model = model
+            if retriever is not None:
+                service.retriever = cast(KeywordRetriever, retriever)
+            if tools is not None:
+                service.tools = cast(SandboxedMockTools, tools)
             return IsolatedVictim(run_id=run_id, service=service)
 
         sandbox = tempfile.TemporaryDirectory(prefix="promptfirewall-run-")
         run_tools = tools or SandboxedMockTools(sandbox_root=Path(sandbox.name))
         service = VictimService(
-            model=model,  # type: ignore[arg-type]
+            model=model,
             retriever=retriever,  # type: ignore[arg-type]
             tools=run_tools,  # type: ignore[arg-type]
             trace_callback=trace_callback,

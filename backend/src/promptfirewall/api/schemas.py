@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from promptfirewall.contracts.attacks import AttackDefinition, BenignCase, CaseKind
 from promptfirewall.contracts.defenses import DefenseDecision, DefenseProfile
@@ -25,6 +25,19 @@ class VictimChatRequest(BaseModel):
     identity: TestIdentity | None = None
     session_id: str = Field(default="session-default", min_length=1, max_length=160)
     run_id: str | None = Field(default=None, min_length=1, max_length=160)
+    defense_profile_id: str = Field(default="full-stack", min_length=1, max_length=160)
+
+    @field_validator("identity")
+    @classmethod
+    def validate_identity(cls, value: TestIdentity | None) -> TestIdentity | None:
+        return validate_test_identity(value)
+
+    @field_validator("message", "session_id", "run_id")
+    @classmethod
+    def nonblank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("must not be blank")
+        return value
 
 
 class VictimChatResponse(BaseModel):
@@ -34,6 +47,8 @@ class VictimChatResponse(BaseModel):
     tool_results: list[ToolResult]
     trace_events: list[TraceEvent]
     access_denials: list[str]
+    defense_decisions: list[DefenseDecision] = Field(default_factory=list)
+    blocked: bool = False
 
 
 class TestRunRequest(BaseModel):
@@ -43,6 +58,29 @@ class TestRunRequest(BaseModel):
     identity: TestIdentity | None = None
     session_id: str = Field(default="session-default", min_length=1, max_length=160)
     run_id: str | None = Field(default=None, min_length=1, max_length=160)
+    model_provider: str | None = None
+    model_name: str | None = None
+
+    @field_validator("identity")
+    @classmethod
+    def validate_identity(cls, value: TestIdentity | None) -> TestIdentity | None:
+        return validate_test_identity(value)
+
+    @field_validator("case_id", "session_id", "run_id", "model_provider", "model_name")
+    @classmethod
+    def nonblank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+def validate_test_identity(value: TestIdentity | None) -> TestIdentity | None:
+    """Validate synthetic test metadata, without treating it as authentication."""
+    if value is not None:
+        for identifier in (value.user_id, value.tenant_id, value.customer_id):
+            if identifier is not None and (not identifier.strip() or len(identifier) > 160):
+                raise ValueError("identity identifiers must contain 1 to 160 characters")
+    return value
 
 
 class RunSummaryResponse(BaseModel):
@@ -102,6 +140,7 @@ class ReportResponse(BaseModel):
     runs: list[RunSummaryResponse]
     metrics: MetricsSnapshot
     generated_at: str
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class CatalogResponse(BaseModel):

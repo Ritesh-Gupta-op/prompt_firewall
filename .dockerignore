@@ -1,0 +1,17 @@
+.git
+.venv
+.verify-venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+.mypy_cache
+.coverage
+.env
+**/.env
+*.db
+*.sqlite3
+.victim-sandbox
+dist
+**/build
+**/*.egg-info
+*.log

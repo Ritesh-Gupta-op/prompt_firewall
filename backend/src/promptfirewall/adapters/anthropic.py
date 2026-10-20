@@ -7,9 +7,15 @@ from typing import Any
 
 import httpx
 
-from promptfirewall.contracts.models import ModelMessage, ModelResponse, ProposedToolCall, ToolDefinition
+from promptfirewall.contracts.models import (
+    ModelMessage,
+    ModelResponse,
+    ProposedToolCall,
+    ToolDefinition,
+)
 
 from .base import (
+    AdapterConfigurationError,
     AdapterResponseError,
     HTTPAdapterMixin,
     MessageInput,
@@ -21,6 +27,7 @@ from .base import (
     endpoint_url,
     generation_started,
     optional_int,
+    parse_structured_tool_fallback,
     parse_tool_arguments,
     validate_generation_parameters,
 )
@@ -43,31 +50,33 @@ class AnthropicAdapter(HTTPAdapterMixin):
         max_retries: int = 2,
         retry_backoff_seconds: float = 0.2,
         anthropic_version: str = "2023-06-01",
+        structured_json_tool_fallback: bool = True,
     ) -> None:
         if not base_url.strip():
-            raise AdapterResponseError(
+            raise AdapterConfigurationError(
                 "model base URL is required",
                 provider=self.provider,
             )
         if not api_key or not api_key.strip():
-            raise AdapterResponseError(
+            raise AdapterConfigurationError(
                 "model API key is required",
                 provider=self.provider,
             )
         if not model.strip():
-            raise AdapterResponseError(
+            raise AdapterConfigurationError(
                 "model name is required",
                 provider=self.provider,
             )
         if client is not None and http_client is not None:
-            raise AdapterResponseError(
+            raise AdapterConfigurationError(
                 "provide only one HTTP client",
                 provider=self.provider,
             )
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url.strip().rstrip("/")
         self.api_key = api_key
         self.model = model
         self.anthropic_version = anthropic_version
+        self.structured_json_tool_fallback = structured_json_tool_fallback
         self._init_http(
             client=client or http_client,
             timeout_seconds=timeout_seconds,
@@ -83,18 +92,26 @@ class AnthropicAdapter(HTTPAdapterMixin):
         seed: int,
         max_tokens: int,
     ) -> ModelResponse:
-        del seed  # Anthropic's Messages API does not expose a seed parameter.
+        # Anthropic's Messages API does not expose a seed parameter. Validate it
+        # at the common interface, but never send an unsupported provider field.
         validate_generation_parameters(
             temperature=temperature,
+            seed=seed,
             max_tokens=max_tokens,
             provider=self.provider,
         )
+        if temperature > 1:
+            raise AdapterConfigurationError(
+                "anthropic temperature must be between 0 and 1", provider=self.provider
+            )
         normalized_messages = coerce_messages(messages)
-        normalized_tools = coerce_tools(tools)
-        system_parts = [message.content for message in normalized_messages if message.role == "system"]
+        normalized_tools = coerce_tools(tools, provider=self.provider)
+        system_parts = [
+            message.content for message in normalized_messages if message.role == "system"
+        ]
         provider_messages = self._messages_payload(normalized_messages)
         if not provider_messages:
-            raise AdapterResponseError(
+            raise AdapterConfigurationError(
                 "anthropic requires at least one user or assistant message",
                 provider=self.provider,
             )
@@ -158,13 +175,18 @@ class AnthropicAdapter(HTTPAdapterMixin):
                         ),
                     )
                 )
+        text = "".join(text_parts)
+        if not tool_calls and self.structured_json_tool_fallback and text:
+            fallback = parse_structured_tool_fallback(text, provider=self.provider)
+            if fallback is not None:
+                text, tool_calls = fallback
         usage = result.get("usage")
         usage_data = usage if isinstance(usage, Mapping) else {}
         stop_reason = result.get("stop_reason")
         finish_reason = stop_reason if isinstance(stop_reason, str) and stop_reason else "stop"
         response_id = result.get("id")
         return ModelResponse(
-            text="".join(text_parts),
+            text=text,
             tool_calls=tool_calls,
             provider=self.provider,
             model=self.model,

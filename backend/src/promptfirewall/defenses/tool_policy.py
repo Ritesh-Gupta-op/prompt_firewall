@@ -31,7 +31,8 @@ _RECORD_RE = re.compile(r"^(?:ticket|order)-demo-\d{3}$", re.I)
 
 def _call(value: ProposedToolCall | Mapping[str, Any] | Any) -> ProposedToolCall | None:
     if isinstance(value, ProposedToolCall):
-        return value
+        # Revalidate model_copy/model_construct objects too: provider data is untrusted.
+        value = {"name": value.name, "arguments": value.arguments, "call_id": value.call_id}
     if isinstance(value, Mapping):
         try:
             return ProposedToolCall.model_validate(value)
@@ -48,8 +49,8 @@ def _role(context: DefenseContext) -> str:
 def _valid_http_url(url: Any) -> bool:
     if not isinstance(url, str):
         return False
-    parsed = urlsplit(url)
     try:
+        parsed = urlsplit(url)
         port = parsed.port
     except ValueError:
         return False
@@ -68,7 +69,10 @@ def _valid_http_url(url: Any) -> bool:
 def _valid_fixture_path(path: Any) -> bool:
     if not isinstance(path, str) or not path or "\x00" in path:
         return False
-    parsed = urlsplit(path)
+    try:
+        parsed = urlsplit(path)
+    except ValueError:
+        return False
     if parsed.scheme != "fixture" or parsed.query or parsed.fragment:
         return False
     relative = f"{parsed.netloc}{parsed.path}"
@@ -97,7 +101,7 @@ class ToolPolicy(Defense):
                 self,
                 DefenseAction.BLOCK,
                 "unknown_tool",
-                metadata={"tool_name": call.name},
+                metadata={"tool_name": "unknown"},
             )
 
         validation_error = self._validate_arguments(call)
@@ -144,9 +148,10 @@ class ToolPolicy(Defense):
     def _validate_arguments(call: ProposedToolCall) -> str | None:
         arguments = call.arguments
         if call.name == "mock_lookup":
+            record_id = arguments.get("record_id")
             return (
                 None
-                if _RECORD_RE.fullmatch(arguments.get("record_id", ""))
+                if isinstance(record_id, str) and _RECORD_RE.fullmatch(record_id)
                 else "invalid_record_id"
             )
         if call.name == "mock_http_get":
@@ -154,7 +159,7 @@ class ToolPolicy(Defense):
         if call.name == "mock_refund":
             order_id = arguments.get("order_id")
             amount = arguments.get("amount_minor")
-            if not _RECORD_RE.fullmatch(order_id or "") or (
+            if not isinstance(order_id, str) or not re.fullmatch(r"order-demo-\d{3}", order_id) or (
                 isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0
             ):
                 return "invalid_refund_arguments"
@@ -170,7 +175,11 @@ class ToolPolicy(Defense):
             content = arguments.get("content")
             if not _valid_fixture_path(arguments.get("path")) or not isinstance(content, str):
                 return "invalid_file_arguments"
-            if len(content.encode("utf-8")) > 16_384:
+            try:
+                size = len(content.encode("utf-8"))
+            except UnicodeEncodeError:
+                return "invalid_file_arguments"
+            if size > 16_384:
                 return "file_too_large"
         return None
 

@@ -5,8 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+
+from promptfirewall.storage.repository import DuplicateRunError
 
 
 class ApiError(Exception):
@@ -34,26 +37,40 @@ def error_body(code: str, message: str, *, details: Any = None) -> dict[str, Any
     return {"error": error}
 
 
-async def api_error_handler(_: Request, error: ApiError) -> JSONResponse:
+async def api_error_handler(_: Request, error: Exception) -> JSONResponse:
+    assert isinstance(error, ApiError)
     return JSONResponse(
         status_code=error.status_code,
-        content=error_body(error.code, error.message, details=error.details),
+        content=jsonable_encoder(error_body(error.code, error.message, details=error.details)),
     )
 
 
-async def validation_error_handler(_: Request, error: RequestValidationError) -> JSONResponse:
+async def validation_error_handler(_: Request, error: Exception) -> JSONResponse:
+    assert isinstance(error, RequestValidationError)
     return JSONResponse(
         status_code=422,
-        content=error_body("validation_error", "Request validation failed", details=error.errors()),
+        content=error_body(
+            "validation_error", "Request validation failed",
+            details=jsonable_encoder(error.errors(), custom_encoder={ValueError: str}),
+        ),
     )
 
 
-async def http_error_handler(_: Request, error: HTTPException) -> JSONResponse:
+async def http_error_handler(_: Request, error: Exception) -> JSONResponse:
+    assert isinstance(error, HTTPException)
     detail = error.detail
     content = detail if isinstance(detail, dict) and "error" in detail else error_body(
         "http_error", str(detail)
     )
     return JSONResponse(status_code=error.status_code, content=content, headers=error.headers)
+
+
+async def duplicate_run_handler(_: Request, error: Exception) -> JSONResponse:
+    assert isinstance(error, DuplicateRunError)
+    return JSONResponse(
+        status_code=409,
+        content=error_body("duplicate_run_id", f"Run ID already exists: {error}"),
+    )
 
 
 __all__ = [

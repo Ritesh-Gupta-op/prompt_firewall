@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -31,7 +31,7 @@ class TraceEvent(BaseModel):
     run_id: str
     sequence: int
     event_type: TraceEventType
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     stage: str | None = None
     correlation_id: str
     payload: dict[str, Any] = Field(default_factory=dict)

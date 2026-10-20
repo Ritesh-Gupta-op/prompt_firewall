@@ -2,7 +2,9 @@ services:
   promptfirewall:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
+    init: true
+    stop_grace_period: 130s
     environment:
       PROMPTFIREWALL_DATABASE_URL: sqlite+aiosqlite:////data/promptfirewall.db
     volumes:

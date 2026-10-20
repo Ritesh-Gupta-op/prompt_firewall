@@ -13,6 +13,7 @@ from promptfirewall.contracts.models import (
     ModelRequest,
     ModelResponse,
     ProposedToolCall,
+    SyncModel,
     TestIdentity,
     ToolResult,
     UserRole,
@@ -70,14 +71,14 @@ class VictimService:
         memory: MemoryStore | None = None,
         retriever: KeywordRetriever | None = None,
         tools: SandboxedMockTools | None = None,
-        model: DeterministicMockModel | None = None,
+        model: SyncModel | None = None,
         trace_callback: TraceCallback | None = None,
     ) -> None:
         self.fixtures = fixtures
         self.memory = memory or MemoryStore()
         self.retriever = retriever or KeywordRetriever(fixtures)
         self.tools = tools or SandboxedMockTools(fixtures=fixtures)
-        self.model = model or DeterministicMockModel()
+        self.model: SyncModel = model if model is not None else DeterministicMockModel()
         self.trace_callback = trace_callback
 
     def run(
@@ -89,7 +90,27 @@ class VictimService:
         run_id: str | None = None,
         authorized_tool_calls: Iterable[ProposedToolCall] = (),
         trace_callback: TraceCallback | None = None,
+        timeout_seconds: float | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        seed: int | None = None,
     ) -> VictimRunResult:
+        # Keep omitted budgets omitted so a provider can apply its configured
+        # timeout. ModelRequest inputs may carry generation options, never approval.
+        options: dict[str, Any] = {}
+        parameters = dict(request.parameters) if isinstance(request, ModelRequest) else {}
+        if isinstance(request, ModelRequest):
+            for name in ("timeout_seconds", "max_tokens"):
+                if name in request.model_fields_set:
+                    options[name] = getattr(request, name)
+        if timeout_seconds is not None:
+            options["timeout_seconds"] = timeout_seconds
+        if max_tokens is not None:
+            options["max_tokens"] = max_tokens
+        if temperature is not None:
+            parameters["temperature"] = temperature
+        if seed is not None:
+            parameters["seed"] = seed
         message, structured_identity, session_id, run_id = self._normalize_request(
             request,
             identity=identity,
@@ -169,11 +190,13 @@ class VictimService:
                 ModelMessage(role="user", content=message),
             ],
             tools=list(self.tools.tool_definitions()),
+            parameters=parameters,
             correlation_id=run_id,
             experiment_metadata={
                 "session_id": session_id,
                 "tenant_id": structured_identity.tenant_id,
             },
+            **options,
         )
         self._emit(
             events,

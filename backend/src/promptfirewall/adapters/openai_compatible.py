@@ -7,7 +7,12 @@ from typing import Any
 
 import httpx
 
-from promptfirewall.contracts.models import ModelMessage, ModelResponse, ProposedToolCall, ToolDefinition
+from promptfirewall.contracts.models import (
+    ModelMessage,
+    ModelResponse,
+    ProposedToolCall,
+    ToolDefinition,
+)
 
 from .base import (
     AdapterConfigurationError,
@@ -51,7 +56,7 @@ class OpenAICompatibleAdapter(HTTPAdapterMixin):
         structured_json_tool_fallback: bool = True,
     ) -> None:
         self.provider = provider
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url.strip().rstrip("/")
         self.model = model
         self.structured_json_tool_fallback = structured_json_tool_fallback
         if not self.base_url:
@@ -92,11 +97,12 @@ class OpenAICompatibleAdapter(HTTPAdapterMixin):
     ) -> ModelResponse:
         validate_generation_parameters(
             temperature=temperature,
+            seed=seed,
             max_tokens=max_tokens,
             provider=self.provider,
         )
         normalized_messages = coerce_messages(messages)
-        normalized_tools = coerce_tools(tools)
+        normalized_tools = coerce_tools(tools, provider=self.provider)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [self._message_payload(message) for message in normalized_messages],
@@ -144,7 +150,7 @@ class OpenAICompatibleAdapter(HTTPAdapterMixin):
                 )
             for index, raw_call in enumerate(native_calls):
                 tool_calls.append(self._native_tool_call(raw_call, index))
-        elif self.structured_json_tool_fallback and text:
+        if not tool_calls and self.structured_json_tool_fallback and text:
             fallback = parse_structured_tool_fallback(text, provider=self.provider)
             if fallback is not None:
                 text, tool_calls = fallback
@@ -189,13 +195,19 @@ class OpenAICompatibleAdapter(HTTPAdapterMixin):
         return ProposedToolCall(
             name=name,
             arguments=parse_tool_arguments(function.get("arguments"), provider=self.provider),
-            call_id=call_id if isinstance(call_id, str) and call_id else f"provider-call-{index + 1}",
+            call_id=(
+                call_id if isinstance(call_id, str) and call_id else f"provider-call-{index + 1}"
+            ),
         )
 
     @staticmethod
     def _message_payload(message: ModelMessage) -> dict[str, str]:
-        role = message.role if message.role in {"system", "user", "assistant", "tool"} else "user"
-        return {"role": role, "content": message.content}
+        # ModelMessage has no native tool_call_id or matching assistant tool call.
+        # Treat synthetic tool-output/context/memory deliveries as untrusted user
+        # data instead of emitting an invalid provider protocol message.
+        if message.role in {"system", "user", "assistant"}:
+            return {"role": message.role, "content": message.content}
+        return {"role": "user", "content": f"[{message.role} data]\n{message.content}"}
 
     @staticmethod
     def _tool_payload(tool: ToolDefinition) -> dict[str, Any]:

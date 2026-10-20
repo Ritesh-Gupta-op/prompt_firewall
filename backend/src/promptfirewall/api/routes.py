@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass, replace
+import asyncio
+from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from time import perf_counter
@@ -12,9 +13,16 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import PlainTextResponse
 
-from promptfirewall.api.dependencies import get_job_manager, get_repository, get_victim_service
+from promptfirewall.api.dependencies import (
+    get_job_manager,
+    get_repository,
+    get_settings_dependency,
+    get_victim_service,
+)
 from promptfirewall.api.errors import ApiError
+from promptfirewall.api.execution import make_runner
 from promptfirewall.api.job_manager import ExperimentJobManager
+from promptfirewall.api.reporting import PersistedReportGenerator
 from promptfirewall.api.schemas import (
     ExperimentCreateResponse,
     ExperimentResponse,
@@ -26,6 +34,7 @@ from promptfirewall.api.schemas import (
     TestRunResponse,
     VictimChatRequest,
     VictimChatResponse,
+    validate_test_identity,
 )
 from promptfirewall.attacks.registry import (
     get_attack,
@@ -33,31 +42,26 @@ from promptfirewall.attacks.registry import (
     get_benign_case,
     get_benign_cases,
 )
+from promptfirewall.config import Settings
 from promptfirewall.contracts.attacks import AttackCategory, AttackDefinition, BenignCase, CaseKind
-from promptfirewall.contracts.defenses import DefenseContext, DefenseProfile
-from promptfirewall.contracts.experiments import ExperimentCreate, RunStatus
-from promptfirewall.contracts.models import ModelResponse, TestIdentity
-from promptfirewall.contracts.results import MetricsSnapshot
+from promptfirewall.contracts.defenses import DefenseProfile
+from promptfirewall.contracts.experiments import ExperimentCreate, ExperimentStatus, RunStatus
+from promptfirewall.contracts.models import TestIdentity, UserRole
+from promptfirewall.contracts.results import MetricsSnapshot, OutcomeLabel
 from promptfirewall.contracts.traces import TraceEvent
-from promptfirewall.defenses.pipeline import DefensePipeline
 from promptfirewall.defenses.registry import DEFAULT_REGISTRY
-from promptfirewall.judges import (
-    PromptDisclosureJudge,
-    StateChangeJudge,
-    ToolMisuseJudge,
-    UtilityJudge,
-    aggregate_judges,
-)
-from promptfirewall.judges.observable_canary_leak import ObservableCanaryLeakJudge
+from promptfirewall.firewall import FirewallService
+from promptfirewall.harness.jobs import ExperimentRecord, ExperimentResult
 from promptfirewall.metrics import calculate_metrics
 from promptfirewall.storage.repository import ExperimentCounts, StorageRepository
-from promptfirewall.victim_app.service import VictimRunResult, VictimService
-
+from promptfirewall.storage.runner import RunnerRepository, defense_decisions, restore_run
+from promptfirewall.victim_app.service import VictimService
 
 router = APIRouter(tags=["promptfirewall"])
 _REPOSITORY = Depends(get_repository)
 _VICTIM = Depends(get_victim_service)
 _JOB_MANAGER = Depends(get_job_manager)
+_SETTINGS = Depends(get_settings_dependency)
 
 
 def _iso(value: datetime) -> str:
@@ -73,7 +77,7 @@ def _json(value: Any) -> Any:
         return _iso(value)
     if hasattr(value, "model_dump"):
         return _json(value.model_dump(mode="json"))
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
         return _json(asdict(value))
     if isinstance(value, dict):
         return {str(key): _json(item) for key, item in value.items()}
@@ -83,7 +87,7 @@ def _json(value: Any) -> Any:
 
 
 def _default_identity() -> TestIdentity:
-    return TestIdentity(user_id="demo-customer", role="customer", customer_id="cust-1001")
+    return TestIdentity(user_id="demo-customer", role=UserRole.CUSTOMER, customer_id="cust-1001")
 
 
 def _run_summary(record: Any) -> RunSummaryResponse:
@@ -137,10 +141,10 @@ def _catalog_case(request: TestRunRequest) -> tuple[Any, str | None, str]:
             raise _not_found("attack", request.case_id) from error
         return case, case.category.value, case.payload_template
     try:
-        case = get_benign_case(request.case_id)
+        benign = get_benign_case(request.case_id)
     except KeyError as error:
         raise _not_found("benign_case", request.case_id) from error
-    return case, None, case.request
+    return benign, None, benign.request
 
 
 def _validate_profile(profile_id: str) -> str:
@@ -155,12 +159,28 @@ def _validate_profile(profile_id: str) -> str:
 
 
 def _experiment_specs(request: ExperimentCreate, *, max_matrix_size: int) -> list[dict[str, Any]]:
+    if request.metadata.get("test_identity") is not None:
+        try:
+            validate_test_identity(TestIdentity.model_validate(request.metadata["test_identity"]))
+        except ValueError as error:
+            raise ApiError(
+                422, "invalid_test_identity", "Invalid test identity metadata",
+            ) from error
+    identifiers = [*request.attack_ids, *request.benign_case_ids]
+    if len(set(identifiers)) != len(identifiers):
+        raise ApiError(422, "duplicate_case", "Case IDs must be unique")
+    if not request.defense_profile_ids:
+        raise ApiError(422, "missing_defense_profile", "Select at least one defense profile")
+    if len(set(request.defense_profile_ids)) != len(request.defense_profile_ids):
+        raise ApiError(422, "duplicate_defense_profile", "Defense profile IDs must be unique")
     cases: list[tuple[str, str, str | None, dict[str, Any]]] = []
     for attack_id in request.attack_ids:
         try:
             attack = get_attack(attack_id)
         except KeyError as error:
             raise ApiError(422, "unknown_attack", f"Unknown attack: {attack_id}") from error
+        if not attack.enabled:
+            raise ApiError(422, "disabled_attack", f"Attack is disabled: {attack_id}")
         cases.append((attack.id, CaseKind.ATTACK.value, attack.category.value, _json(attack)))
     for benign_id in request.benign_case_ids:
         try:
@@ -181,7 +201,7 @@ def _experiment_specs(request: ExperimentCreate, *, max_matrix_size: int) -> lis
             "Experiment matrix exceeds the configured maximum",
             details={"requested": total, "maximum": max_matrix_size},
         )
-    return [
+    specs: list[dict[str, Any]] = [
         {
             "id": f"run-{uuid4().hex}",
             "case_id": case_id,
@@ -194,6 +214,9 @@ def _experiment_specs(request: ExperimentCreate, *, max_matrix_size: int) -> lis
         for profile_id in profiles
         for repetition_index in range(request.repetitions)
     ]
+    for index, spec in enumerate(specs):
+        spec["input_payload"]["matrix_index"] = index
+    return specs
 
 
 @router.get("/health", response_model=HealthResponse, operation_id="apiHealth")
@@ -241,33 +264,45 @@ async def victim_chat(
     request: VictimChatRequest,
     repository: StorageRepository = _REPOSITORY,
     victim: VictimService = _VICTIM,
+    settings: Settings = _SETTINGS,
 ) -> VictimChatResponse:
     run_id = request.run_id or f"run-{uuid4().hex}"
     identity = request.identity or _default_identity()
-    try:
-        result = victim.run(
-            request.message,
-            identity,
-            session_id=request.session_id,
-            run_id=run_id,
-        )
-    except ValueError as error:
-        raise ApiError(422, "invalid_victim_request", str(error)) from error
+    profile_id = _validate_profile(request.defense_profile_id)
     await repository.create_run(
-        run_id=result.run_id,
-        experiment_id=None,
-        case_id="chat",
-        case_kind="chat",
-        defense_profile_id="none",
-        input_payload={"message": request.message, "identity": _json(identity)},
+        run_id=run_id, experiment_id=None, case_id="chat", case_kind="chat",
+        defense_profile_id=profile_id, status=RunStatus.RUNNING,
+        input_payload={"message": request.message, "identity": _json(identity),
+                       "session_id": request.session_id},
     )
-    await repository.save_run_result(
-        result.run_id,
-        status=RunStatus.COMPLETED,
-        latency_ms=result.model_response.latency_ms,
-        result=_victim_result_payload(result),
-    )
-    await repository.add_trace_events(result.run_id, result.trace_events)
+    started = perf_counter()
+    try:
+        result = await asyncio.to_thread(
+            FirewallService(victim).run, request.message, identity,
+            session_id=request.session_id, run_id=run_id, defense_profile_id=profile_id,
+            timeout_seconds=settings.model_timeout_seconds,
+        )
+        if result.run_id != run_id:
+            raise RuntimeError("Firewall returned a different run ID")
+        await repository.add_trace_events(run_id, result.trace_events)
+        await repository.save_run_result(
+            run_id, status=RunStatus.COMPLETED, latency_ms=(perf_counter() - started) * 1000,
+            result={
+                "session_id": result.session_id, "response": _json(result.model_response),
+                "tool_results": _json(result.tool_results),
+                "defense_decisions": _json(result.defense_decisions),
+                "blocked": result.blocked, "access_denials": list(result.access_denials),
+            },
+        )
+    except Exception as error:
+        await repository.save_run_result(
+            run_id, status=RunStatus.FAILED, outcome="execution_error",
+            latency_ms=(perf_counter() - started) * 1000,
+            error={"code": "chat_execution_error", "type": type(error).__name__,
+                   "message": str(error)},
+        )
+        raise ApiError(502, "chat_execution_error", "Chat execution failed",
+                       details={"run_id": run_id}) from error
     return VictimChatResponse(
         run_id=result.run_id,
         session_id=result.session_id,
@@ -275,6 +310,8 @@ async def victim_chat(
         tool_results=list(result.tool_results),
         trace_events=list(result.trace_events),
         access_denials=list(result.access_denials),
+        defense_decisions=list(result.defense_decisions),
+        blocked=result.blocked,
     )
 
 
@@ -283,12 +320,23 @@ async def victim_chat(
 async def victim_test_run(
     request: TestRunRequest,
     repository: StorageRepository = _REPOSITORY,
-    victim: VictimService = _VICTIM,
+    settings: Settings = _SETTINGS,
 ) -> TestRunResponse:
-    case, category, message = _catalog_case(request)
+    case, category, _ = _catalog_case(request)
     profile_id = _validate_profile(request.defense_profile_id)
     run_id = request.run_id or f"run-{uuid4().hex}"
-    identity = request.identity or _default_identity()
+    metadata: dict[str, Any] = {"session_id": request.session_id}
+    if request.identity is not None:
+        metadata["test_identity"] = _json(request.identity)
+    experiment = ExperimentCreate(
+        name=f"Test {request.case_id}",
+        attack_ids=[request.case_id] if request.case_kind is CaseKind.ATTACK else [],
+        benign_case_ids=[request.case_id] if request.case_kind is CaseKind.BENIGN else [],
+        defense_profile_ids=[profile_id], concurrency_limit=1,
+        model_provider=request.model_provider or settings.model_provider,
+        model_name=request.model_name or settings.model_name, metadata=metadata,
+    )
+    _experiment_specs(experiment, max_matrix_size=settings.max_matrix_size)
     await repository.create_run(
         run_id=run_id,
         experiment_id=None,
@@ -296,107 +344,36 @@ async def victim_test_run(
         case_kind=request.case_kind.value,
         defense_profile_id=profile_id,
         category=category,
-        input_payload={"case": _json(case), "identity": _json(identity)},
+        input_payload={"case": _json(case), **metadata},
     )
-    started = perf_counter()
-    context = DefenseContext(
-        run_id=run_id,
-        correlation_id=run_id,
-        identity=_json(identity),
-        metadata={"case_id": request.case_id, "case_kind": request.case_kind.value},
+    bridge = RunnerRepository(
+        repository.session.info["session_factory"], asyncio.get_running_loop(), standalone=True,
     )
-    pipeline = DefensePipeline(profile_id)
-    input_result = pipeline.process_input(message, context)
-    decisions = list(input_result.decisions)
-    response: ModelResponse | None = None
-    tool_results: list[Any] = []
-    trace_events: list[Any] = []
-    blocked = input_result.blocked
-    if blocked:
-        observed: Any = {
-            "text": "Request blocked by the selected defense profile.",
-            "tool_results": [],
-            "trace_events": [],
-            "state_before": {},
-            "state_after": {},
-            "blocked": True,
-        }
-    else:
-        try:
-            result = victim.run(
-                input_result.payload.content,
-                identity,
-                session_id=request.session_id,
-                run_id=run_id,
-            )
-        except ValueError as error:
-            await repository.save_run_result(
-                run_id,
-                status=RunStatus.FAILED,
-                latency_ms=(perf_counter() - started) * 1000,
-                error={"code": "victim_execution_error", "message": str(error)},
-            )
-            raise ApiError(422, "invalid_victim_request", str(error)) from error
-        output_result = pipeline.scan_output(result.model_response, context)
-        decisions.extend(output_result.decisions)
-        response = output_result.payload.content
-        if not isinstance(response, ModelResponse):
-            response = result.model_response
-        result = replace(result, model_response=response)
-        tool_results = list(result.tool_results)
-        trace_events = list(result.trace_events)
-        observed = result
-    judge_results = [
-        ObservableCanaryLeakJudge().evaluate(observed),
-        PromptDisclosureJudge().evaluate(observed),
-        ToolMisuseJudge().evaluate(observed),
-        StateChangeJudge().evaluate(observed),
-    ]
-    if request.case_kind is CaseKind.BENIGN:
-        judge_results.append(UtilityJudge().evaluate(observed))
-    aggregate = aggregate_judges(judge_results, case_kind=request.case_kind.value)
-    outcome = aggregate.outcome
-    latency_ms = response.latency_ms if response is not None else (perf_counter() - started) * 1000
-    result_payload = {
-        "case": _json(case),
-        "response": _json(response),
-        "tool_results": _json(tool_results),
-        "defense_decisions": _json(decisions),
-        "judge_results": _json(judge_results),
-        "evidence": _json(aggregate.evidence),
-        "blocked": blocked,
-    }
-    saved = await repository.save_run_result(
-        run_id,
-        status=RunStatus.COMPLETED,
-        outcome=outcome,
-        latency_ms=latency_ms,
-        result=result_payload,
-    )
+    runner = make_runner(settings, experiment, bridge, [run_id])
+    try:
+        execution = await asyncio.to_thread(runner.run, experiment, experiment_id=f"test-{run_id}")
+    except Exception as error:
+        await repository.save_run_result(
+            run_id, status=RunStatus.FAILED, outcome="execution_error",
+            error={"code": "test_execution_error", "type": type(error).__name__,
+                   "message": str(error)},
+        )
+        raise ApiError(502, "test_execution_error", "Test execution failed",
+                       details={"run_id": run_id}) from error
+    result = execution.runs[0]
+    saved = await repository.get_run(run_id)
     if saved is None:
         raise _not_found("run", run_id)
-    await repository.add_trace_events(run_id, trace_events)
     return TestRunResponse(
         run=_run_summary(saved),
-        response=response,
-        tool_results=tool_results,
-        trace_events=trace_events,
-        defense_decisions=decisions,
-        judge_results=judge_results,
-        outcome=outcome,
-        blocked=blocked,
+        response=result.model_response,
+        tool_results=list(result.tool_results),
+        trace_events=list(result.trace_events),
+        defense_decisions=defense_decisions(result.trace_events),
+        judge_results=list(result.judge_results),
+        outcome=result.outcome or OutcomeLabel.EXECUTION_ERROR,
+        blocked=result.blocked,
     )
-
-
-def _victim_result_payload(result: VictimRunResult) -> dict[str, Any]:
-    return {
-        "session_id": result.session_id,
-        "response": _json(result.model_response),
-        "tool_results": _json(result.tool_results),
-        "retrieved": _json(result.retrieved),
-        "memory": _json(result.memory),
-        "access_denials": list(result.access_denials),
-    }
 
 
 @router.post(
@@ -411,13 +388,23 @@ async def create_experiment(
 ) -> ExperimentCreateResponse:
     settings = repository.session.info.get("settings")
     max_matrix_size = getattr(settings, "max_matrix_size", 500)
+    defaults = {}
+    if "model_provider" not in request.model_fields_set:
+        defaults["model_provider"] = getattr(settings, "model_provider", "mock")
+    if "model_name" not in request.model_fields_set:
+        defaults["model_name"] = getattr(settings, "model_name", "promptfirewall-mock-1")
+    request = request.model_copy(update=defaults)
     specs = _experiment_specs(request, max_matrix_size=max_matrix_size)
     record = await repository.create_experiment_with_runs(request, specs)
     submitted = True
     try:
         await job_manager.submit(record.id)
-    except Exception:
+    except Exception as error:
         submitted = False
+        await repository.fail_experiment(record.id, {
+            "code": "submission_failed", "type": type(error).__name__, "message": str(error),
+        })
+    record = await _require_experiment(repository, record.id)
     counts = await repository.counts_for_experiment(record.id)
     return ExperimentCreateResponse(
         **_experiment_response(record, counts).model_dump(),
@@ -541,7 +528,9 @@ def _trace_response(event: Any) -> TraceEvent:
         run_id=event.run_id,
         sequence=event.sequence,
         event_type=event.event_type,
-        timestamp=event.timestamp,
+        timestamp=(
+            event.timestamp if event.timestamp.tzinfo else event.timestamp.replace(tzinfo=UTC)
+        ),
         stage=event.stage,
         correlation_id=event.correlation_id,
         payload=event.payload,
@@ -571,49 +560,43 @@ async def _build_report(
     experiment = await _require_experiment(repository, experiment_id)
     counts = await repository.counts_for_experiment(experiment_id)
     runs = await repository.list_runs(experiment_id=experiment_id, limit=100_000)
+    source = await _report_source(experiment, runs, repository)
+    evidence = PersistedReportGenerator().to_dict(source)
     return ReportResponse(
         experiment=_experiment_response(experiment, counts),
         runs=[_run_summary(run) for run in runs],
-        metrics=calculate_metrics(await repository.metric_records(experiment_id)),
+        metrics=source.metrics,
         generated_at=datetime.now(UTC).isoformat(),
+        evidence=evidence["runs"],
     )
 
 
-def _markdown_report(report: ReportResponse) -> str:
-    metrics = report.metrics
-    lines = [
-        f"# PromptFirewall report: {report.experiment.name}",
-        "",
-        f"- Experiment ID: `{report.experiment.id}`",
-        f"- Status: `{report.experiment.status.value}`",
-        f"- Runs: {report.experiment.total_runs}",
-        "",
-        "## Metrics",
-        "",
-        "| Metric | Value |",
-        "| --- | ---: |",
-        f"| Attack success rate | {_metric_value(metrics.attack_success_rate.value)} |",
-        f"| Attack block rate | {_metric_value(metrics.attack_block_rate.value)} |",
-        f"| False positive rate | {_metric_value(metrics.false_positive_rate.value)} |",
-        f"| Utility retention | {_metric_value(metrics.utility_retention.value)} |",
-        f"| Error rate | {_metric_value(metrics.error_rate.value)} |",
-        f"| Median latency (ms) | {_metric_value(metrics.median_latency_ms)} |",
-        "",
-        "## Runs",
-        "",
-        "| ID | Case | Profile | Status | Outcome |",
-        "| --- | --- | --- | --- | --- |",
+async def _report_source(
+    experiment: Any, runs: list[Any], repository: StorageRepository,
+) -> ExperimentResult:
+    records = [
+        restore_run(run, [
+            _trace_response(event) for event in await repository.list_trace_events(run.id)
+        ])
+        for run in runs
     ]
-    lines.extend(
-        f"| `{run.id}` | `{run.case_id}` | `{run.defense_profile_id}` | `{run.status.value}` | "
-        f"`{run.outcome or 'pending'}` |"
-        for run in report.runs
+    return ExperimentResult(
+        experiment=ExperimentRecord(
+            id=experiment.id, request=ExperimentCreate.model_validate(experiment.config),
+            status=ExperimentStatus(experiment.status), runs=records,
+            created_at=experiment.created_at, updated_at=experiment.updated_at,
+        ),
+        metrics=calculate_metrics([
+            record for record in records if record.status in (RunStatus.COMPLETED, RunStatus.FAILED)
+        ]),
     )
-    return "\n".join(lines) + "\n"
 
 
-def _metric_value(value: float | None) -> str:
-    return "—" if value is None else f"{value:.4f}"
+async def _markdown_report(experiment_id: str, repository: StorageRepository) -> str:
+    experiment = await _require_experiment(repository, experiment_id)
+    runs = await repository.list_runs(experiment_id=experiment_id, limit=100_000)
+    source = await _report_source(experiment, runs, repository)
+    return PersistedReportGenerator().render_markdown(source)
 
 
 @router.get(
@@ -626,10 +609,11 @@ async def export_experiment_report(
     format: Literal["json", "markdown"] = Query(default="json"),
     repository: StorageRepository = _REPOSITORY,
 ) -> ReportResponse | PlainTextResponse:
-    report = await _build_report(experiment_id, repository)
     if format == "markdown":
-        return PlainTextResponse(_markdown_report(report), media_type="text/markdown")
-    return report
+        return PlainTextResponse(
+            await _markdown_report(experiment_id, repository), media_type="text/markdown",
+        )
+    return await _build_report(experiment_id, repository)
 
 
 @router.get(
@@ -654,7 +638,7 @@ async def export_experiment_report_markdown(
     repository: StorageRepository = _REPOSITORY,
 ) -> PlainTextResponse:
     return PlainTextResponse(
-        _markdown_report(await _build_report(experiment_id, repository)),
+        await _markdown_report(experiment_id, repository),
         media_type="text/markdown",
     )
 

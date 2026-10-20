@@ -8,13 +8,16 @@ FastAPI.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass
+import asyncio
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
-from typing import Any
+from functools import wraps
+from typing import Any, Concatenate, ParamSpec, TypeVar
 from uuid import uuid4
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from promptfirewall.contracts.experiments import ExperimentCreate, ExperimentStatus, RunStatus
@@ -27,8 +30,12 @@ def _now() -> datetime:
 
 
 def _as_json(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
+    if is_dataclass(value) and not isinstance(value, type):
+        return _as_json(asdict(value))
     if isinstance(value, tuple):
         return [_as_json(item) for item in value]
     if isinstance(value, list):
@@ -38,6 +45,35 @@ def _as_json(value: Any) -> Any:
     if hasattr(value, "value"):
         return value.value
     return value
+
+
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+def transaction(
+    method: Callable[Concatenate[StorageRepository, P], Awaitable[T]],
+) -> Callable[Concatenate[StorageRepository, P], Awaitable[T]]:
+    """Keep each repository operation atomic, with no idle read transaction."""
+    @wraps(method)
+    async def wrapped(self: StorageRepository, /, *args: P.args, **kwargs: P.kwargs) -> T:
+        lock = self.session.info.setdefault("storage_lock", asyncio.Lock())
+        async with lock:
+            try:
+                result = await method(self, *args, **kwargs)
+                await self.session.commit()
+                return result
+            except BaseException:
+                await self.session.rollback()
+                raise
+    return wrapped
+
+
+class DuplicateRunError(ValueError):
+    """A caller attempted to reserve an already-used run ID."""
+
+
+_ACTIVE = (RunStatus.QUEUED.value, RunStatus.RUNNING.value)
 
 
 @dataclass(frozen=True)
@@ -61,6 +97,7 @@ class StorageRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    @transaction
     async def create_experiment(
         self,
         request: ExperimentCreate,
@@ -84,6 +121,7 @@ class StorageRepository:
         await self.session.refresh(record)
         return record
 
+    @transaction
     async def create_experiment_with_runs(
         self,
         request: ExperimentCreate,
@@ -125,6 +163,7 @@ class StorageRepository:
         await self.session.refresh(record)
         return record
 
+    @transaction
     async def list_experiments(
         self,
         *,
@@ -139,9 +178,11 @@ class StorageRepository:
         )
         return list(result)
 
+    @transaction
     async def get_experiment(self, experiment_id: str) -> ExperimentRecord | None:
-        return await self.session.get(ExperimentRecord, experiment_id)
+        return await self.session.get(ExperimentRecord, experiment_id, populate_existing=True)
 
+    @transaction
     async def counts_for_experiment(self, experiment_id: str) -> ExperimentCounts:
         rows = await self.session.scalars(
             select(RunRecord.status).where(RunRecord.experiment_id == experiment_id)
@@ -154,24 +195,30 @@ class StorageRepository:
             cancelled_runs=statuses.count(RunStatus.CANCELLED.value),
         )
 
+    @transaction
     async def update_experiment_status(
         self,
         experiment_id: str,
         status: ExperimentStatus | str,
     ) -> ExperimentRecord | None:
-        record = await self.get_experiment(experiment_id)
+        record = await self.session.get(ExperimentRecord, experiment_id, populate_existing=True)
         if record is None:
             return None
+        if record.status not in _ACTIVE:
+            return record
         record.status = getattr(status, "value", status)
         record.updated_at = _now()
         await self.session.commit()
         await self.session.refresh(record)
         return record
 
+    @transaction
     async def cancel_experiment(self, experiment_id: str) -> ExperimentRecord | None:
-        record = await self.get_experiment(experiment_id)
+        record = await self.session.get(ExperimentRecord, experiment_id, populate_existing=True)
         if record is None:
             return None
+        if record.status not in _ACTIVE:
+            return record
         record.cancel_requested = True
         record.status = ExperimentStatus.CANCELLED.value
         record.updated_at = _now()
@@ -181,12 +228,16 @@ class StorageRepository:
                 RunRecord.experiment_id == experiment_id,
                 RunRecord.status.in_([RunStatus.QUEUED.value, RunStatus.RUNNING.value]),
             )
-            .values(status=RunStatus.CANCELLED.value, updated_at=_now())
+            .values(
+                status=RunStatus.CANCELLED.value, updated_at=_now(),
+                error={"code": "cancelled", "message": "Cancellation requested"},
+            )
         )
         await self.session.commit()
         await self.session.refresh(record)
         return record
 
+    @transaction
     async def create_run(
         self,
         *,
@@ -213,10 +264,17 @@ class StorageRepository:
             updated_at=now,
         )
         self.session.add(record)
-        await self.session.commit()
+        try:
+            await self.session.commit()
+        except IntegrityError as error:
+            await self.session.rollback()
+            if run_id and await self.session.get(RunRecord, run_id) is not None:
+                raise DuplicateRunError(run_id) from error
+            raise
         await self.session.refresh(record)
         return record
 
+    @transaction
     async def list_runs(
         self,
         *,
@@ -224,14 +282,19 @@ class StorageRepository:
         offset: int = 0,
         limit: int = 100,
     ) -> list[RunRecord]:
-        query = select(RunRecord).order_by(RunRecord.created_at.asc()).offset(offset).limit(limit)
+        query = (
+            select(RunRecord).execution_options(populate_existing=True)
+            .order_by(RunRecord.created_at.asc()).offset(offset).limit(limit)
+        )
         if experiment_id is not None:
             query = query.where(RunRecord.experiment_id == experiment_id)
         return list(await self.session.scalars(query))
 
+    @transaction
     async def get_run(self, run_id: str) -> RunRecord | None:
-        return await self.session.get(RunRecord, run_id)
+        return await self.session.get(RunRecord, run_id, populate_existing=True)
 
+    @transaction
     async def save_run_result(
         self,
         run_id: str,
@@ -242,19 +305,31 @@ class StorageRepository:
         result: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
     ) -> RunRecord | None:
-        record = await self.get_run(run_id)
+        record = await self.session.get(RunRecord, run_id, populate_existing=True)
         if record is None:
             return None
-        record.status = getattr(status, "value", status)
-        record.outcome = getattr(outcome, "value", outcome)
-        record.latency_ms = latency_ms
+        # A late worker may still return evidence after cancellation, but must never
+        # resurrect a terminal run or change its contribution to metrics.
+        if record.status not in _ACTIVE and record.status != RunStatus.CANCELLED.value:
+            return record
+        if record.status != RunStatus.CANCELLED.value:
+            record.status = getattr(status, "value", status)
+            record.outcome = getattr(outcome, "value", outcome)
+            record.error = _as_json(error)
+        if record.status != RunStatus.CANCELLED.value:
+            record.latency_ms = latency_ms
         record.result = _as_json(result or {})
-        record.error = _as_json(error)
+        if "status" in record.result:
+            record.result = {
+                **record.result, "status": record.status,
+                "outcome": record.outcome, "error": record.error,
+            }
         record.updated_at = _now()
         await self.session.commit()
         await self.session.refresh(record)
         return record
 
+    @transaction
     async def add_trace_events(
         self,
         run_id: str,
@@ -262,14 +337,17 @@ class StorageRepository:
     ) -> None:
         records: list[TraceEventRecord] = []
         for event in events:
-            payload = _as_json(event)
+            validated = TraceEvent.model_validate(event)
+            if validated.run_id != run_id:
+                raise ValueError("trace run_id does not match its owning run")
+            payload = validated.model_dump(mode="json")
             records.append(
                 TraceEventRecord(
                     event_id=str(payload["event_id"]),
                     run_id=run_id,
                     sequence=int(payload["sequence"]),
                     event_type=str(payload["event_type"]),
-                    timestamp=payload.get("timestamp", _now()),
+                    timestamp=validated.timestamp,
                     stage=payload.get("stage"),
                     correlation_id=str(payload["correlation_id"]),
                     payload=payload.get("payload", {}),
@@ -282,6 +360,7 @@ class StorageRepository:
             self.session.add_all(records)
             await self.session.commit()
 
+    @transaction
     async def list_trace_events(self, run_id: str) -> list[TraceEventRecord]:
         result = await self.session.scalars(
             select(TraceEventRecord)
@@ -303,9 +382,47 @@ class StorageRepository:
                 "error": run.error,
             }
             for run in runs
+            if run.status in (RunStatus.COMPLETED.value, RunStatus.FAILED.value)
         ]
+
+    @transaction
+    async def fail_experiment(self, experiment_id: str, error: dict[str, Any]) -> None:
+        record = await self.session.get(ExperimentRecord, experiment_id, populate_existing=True)
+        if record is None or record.status not in _ACTIVE:
+            return
+        record.status = ExperimentStatus.FAILED.value
+        record.updated_at = _now()
+        record.experiment_metadata = {**record.experiment_metadata, "execution_error": error}
+        await self.session.execute(
+            update(RunRecord).where(
+                RunRecord.experiment_id == experiment_id, RunRecord.status.in_(_ACTIVE),
+            ).values(
+                status=RunStatus.FAILED.value, outcome="execution_error", error=error,
+                updated_at=_now(),
+            )
+        )
+
+    @transaction
+    async def mark_interrupted(self) -> None:
+        """A fresh process cannot resume work owned by a previous process."""
+        error = {
+            "code": "process_interrupted", "message": "Execution interrupted by process restart",
+        }
+        experiments = await self.session.scalars(
+            select(ExperimentRecord).where(ExperimentRecord.status.in_(_ACTIVE))
+        )
+        for record in experiments:
+            record.status = ExperimentStatus.FAILED.value
+            record.updated_at = _now()
+            record.experiment_metadata = {**record.experiment_metadata, "execution_error": error}
+        await self.session.execute(
+            update(RunRecord).where(RunRecord.status.in_(_ACTIVE)).values(
+                status=RunStatus.FAILED.value, outcome="execution_error", error=error,
+                updated_at=_now(),
+            )
+        )
 
 
 Repository = StorageRepository
 
-__all__ = ["ExperimentCounts", "Repository", "StorageRepository"]
+__all__ = ["DuplicateRunError", "ExperimentCounts", "Repository", "StorageRepository"]

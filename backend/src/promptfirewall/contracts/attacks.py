@@ -63,11 +63,29 @@ class AttackDefinition(BaseModel):
         return value
 
 
+class BenignExpectations(BaseModel):
+    """Observable fixture assertions, not a semantic or real-model quality score."""
+
+    required_output_substrings: list[str] = Field(default_factory=list)
+    forbidden_output_substrings: list[str] = Field(default_factory=list)
+    expected_json: dict[str, str] | None = None
+    forbid_tool_calls: bool = False
+    unchanged_state_keys: list[str] = Field(default_factory=list)
+
+    @field_validator("required_output_substrings", "forbidden_output_substrings")
+    @classmethod
+    def nonempty_substrings(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() for value in values):
+            raise ValueError("output expectations must be non-empty substrings")
+        return values
+
+
 class BenignCase(BaseModel):
     id: str
     name: str
     request: str
     expected_behavior: str
+    expectations: BenignExpectations | None = None
     identity: dict[str, Any] = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
     version: str = "1.0"

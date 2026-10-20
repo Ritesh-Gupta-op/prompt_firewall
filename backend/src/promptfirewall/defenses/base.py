@@ -60,16 +60,18 @@ def replace_payload(
     original_content: Any | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> DefensePayload:
-    """Create a payload while preserving the contract's metadata."""
+    """Create an effective payload without retaining sensitive pre-filter content.
 
+    The legacy argument is accepted for callers, but originals must never survive
+    serialization of a sanitized decision or pipeline result.
+    """
+
+    del original_content
     merged_metadata = {**payload.metadata, **(metadata or {})}
-    original = payload.original_content
-    if original is None and original_content is not None:
-        original = original_content
     return payload.model_copy(
         update={
             "content": content,
-            "original_content": original,
+            "original_content": None,
             "metadata": merged_metadata,
         }
     )

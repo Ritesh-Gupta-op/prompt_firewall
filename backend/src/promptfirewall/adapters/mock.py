@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from promptfirewall.contracts.models import ModelMessage, ModelRequest, ModelResponse, ToolDefinition
+from promptfirewall.contracts.models import ModelRequest, ModelResponse
 from promptfirewall.victim_app.model import DeterministicMockModel
 
 from .base import (
@@ -13,6 +13,7 @@ from .base import (
     ToolInput,
     coerce_messages,
     coerce_tools,
+    validate_generation_parameters,
 )
 
 
@@ -48,10 +49,13 @@ class MockAdapter:
         seed: int,
         max_tokens: int,
     ) -> ModelResponse:
+        validate_generation_parameters(
+            temperature=temperature, seed=seed, max_tokens=max_tokens, provider=self.provider
+        )
         request = ModelRequest(
             system_instructions="",
             messages=coerce_messages(messages),
-            tools=coerce_tools(tools),
+            tools=coerce_tools(tools, provider=self.provider),
             parameters={"temperature": temperature, "seed": seed},
             correlation_id="mock-adapter",
             max_tokens=max_tokens,
@@ -60,6 +64,9 @@ class MockAdapter:
         if model.seed != seed or model.model_name != self.model_name:
             model = DeterministicMockModel(seed=seed, model_name=self.model_name)
         return model.complete(request)
+
+    async def aclose(self) -> None:
+        """The offline model has no external resources."""
 
 
 assert isinstance(MockAdapter(), ModelAdapter)

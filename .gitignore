@@ -14,3 +14,10 @@ backend/.env
 .DS_Store
 .env
 !.env.example
+.victim-sandbox/
+*.egg-info/
+build/
+dist/
+.verify-venv/
+*.db
+*.sqlite3

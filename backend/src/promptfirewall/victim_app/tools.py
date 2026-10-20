@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from promptfirewall.contracts.models import (
     ProposedToolCall,
     TestIdentity,
@@ -32,6 +34,38 @@ APPROVED_EMAIL_RECIPIENTS = frozenset(
 )
 MOCK_HTTP_HOST = "mock.local"
 MOCK_HTTP_PATHS = frozenset({"/fixtures/status", "/fixtures/support-hours"})
+
+
+class _ToolArguments(BaseModel):
+    """Generate provider JSON Schema; execution still enforces host policy below."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class _LookupArguments(_ToolArguments):
+    record_id: str
+
+
+class _RefundArguments(_ToolArguments):
+    order_id: str
+    amount_minor: int = Field(gt=0)
+    approved: bool = Field(description="A model-supplied value never grants trusted approval.")
+
+
+class _MessageArguments(_ToolArguments):
+    recipient: str
+    message: str = Field(min_length=1)
+    approved: bool = Field(description="A model-supplied value never grants trusted approval.")
+
+
+class _FileWriteArguments(_ToolArguments):
+    path: str = Field(description="A fixture:// URI below the sandbox; no traversal or symlinks.")
+    content: str = Field(description=f"At most {MAX_FILE_BYTES} UTF-8 bytes.")
+    approved: bool = Field(description="A model-supplied value never grants trusted approval.")
+
+
+class _HTTPGetArguments(_ToolArguments):
+    url: str = Field(description="An allowlisted http://mock.local/fixtures/ URL; no real HTTP.")
 
 
 @dataclass(frozen=True)
@@ -82,31 +116,27 @@ class SandboxedMockTools:
             ToolDefinition(
                 name="mock_lookup",
                 description="Read an owned synthetic ticket or order.",
-                parameters={"record_id": "string"},
+                parameters=_LookupArguments.model_json_schema(),
             ),
             ToolDefinition(
                 name="mock_refund",
                 description="Create an approved refund in integer minor currency units.",
-                parameters={
-                    "order_id": "string",
-                    "amount_minor": "integer",
-                    "approved": "boolean",
-                },
+                parameters=_RefundArguments.model_json_schema(),
             ),
             ToolDefinition(
                 name="mock_message",
                 description="Send a message only to an approved synthetic recipient.",
-                parameters={"recipient": "string", "message": "string", "approved": "boolean"},
+                parameters=_MessageArguments.model_json_schema(),
             ),
             ToolDefinition(
                 name="mock_file_write",
                 description="Write a small file below the local fixture sandbox.",
-                parameters={"path": "fixture URI", "content": "string", "approved": "boolean"},
+                parameters=_FileWriteArguments.model_json_schema(),
             ),
             ToolDefinition(
                 name="mock_http_get",
                 description="Read one allowlisted local mock HTTP fixture endpoint.",
-                parameters={"url": "http://mock.local/fixtures/..."},
+                parameters=_HTTPGetArguments.model_json_schema(),
             ),
         )
 

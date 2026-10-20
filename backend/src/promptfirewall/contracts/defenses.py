@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -42,7 +42,7 @@ class DefenseDecision(BaseModel):
     stage: DefenseStage
     action: DefenseAction
     reason_code: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     payload: DefensePayload | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 

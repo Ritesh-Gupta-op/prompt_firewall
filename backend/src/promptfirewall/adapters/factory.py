@@ -45,12 +45,9 @@ def create_model_adapter(
 ) -> ModelAdapter:
     """Build the configured adapter without making a network request."""
 
-    effective_settings = settings or Settings()
-    provider = effective_settings.model_provider.strip().casefold()
-    provider = {"github_models": "github-models", "openai_compatible": "openai-compatible"}.get(
-        provider, provider
-    )
-    if provider in {"mock", "deterministic"}:
+    effective_settings = resolve_model_settings(settings or Settings())
+    provider = effective_settings.model_provider
+    if provider == "mock":
         return MockAdapter(model_name=effective_settings.model_name)
 
     api_key = (
@@ -58,30 +55,61 @@ def create_model_adapter(
         if effective_settings.model_api_key is not None
         else None
     )
-    base_url = effective_settings.model_base_url or DEFAULT_BASE_URLS.get(provider)
-    model_name = effective_settings.model_name
-    if model_name == "promptfirewall-mock-1":
-        model_name = DEFAULT_MODEL_NAMES.get(provider, model_name)
-    common = {
-        "api_key": api_key,
-        "model": model_name,
-        "client": client,
-        "timeout_seconds": effective_settings.model_timeout_seconds,
-        "max_retries": effective_settings.model_max_retries,
-        "retry_backoff_seconds": effective_settings.model_retry_backoff_seconds,
-    }
-    if provider in _OPENAI_COMPATIBLE_PROVIDERS or provider == "openai-compatible":
-        if base_url is None:
-            raise AdapterConfigurationError(
-                "model base URL is required for the selected provider",
-                provider=provider,
-            )
-        return OpenAICompatibleAdapter(base_url=base_url, provider=provider, **common)
+    base_url = effective_settings.model_base_url
+    assert base_url is not None  # Validated without constructing a client below.
     if provider == "anthropic":
-        return AnthropicAdapter(base_url=base_url or DEFAULT_BASE_URLS["anthropic"], **common)
-    raise AdapterConfigurationError(
-        f"unsupported model provider: {provider}",
-        provider=provider or "unknown",
+        return AnthropicAdapter(
+            base_url=base_url,
+            api_key=api_key,
+            model=effective_settings.model_name,
+            client=client,
+            timeout_seconds=effective_settings.model_timeout_seconds,
+            max_retries=effective_settings.model_max_retries,
+            retry_backoff_seconds=effective_settings.model_retry_backoff_seconds,
+        )
+    return OpenAICompatibleAdapter(
+        base_url=base_url,
+        provider=provider,
+        api_key=api_key,
+        model=effective_settings.model_name,
+        client=client,
+        timeout_seconds=effective_settings.model_timeout_seconds,
+        max_retries=effective_settings.model_max_retries,
+        retry_backoff_seconds=effective_settings.model_retry_backoff_seconds,
+    )
+
+
+def resolve_model_settings(settings: Settings) -> Settings:
+    """Resolve and validate selection without allocating loop-bound HTTP resources."""
+
+    provider = settings.model_provider.strip().casefold()
+    provider = {
+        "deterministic": "mock",
+        "github_models": "github-models",
+        "openai_compatible": "openai-compatible",
+    }.get(provider, provider)
+    if provider not in {*_OPENAI_COMPATIBLE_PROVIDERS, "anthropic", "openai-compatible", "mock"}:
+        raise AdapterConfigurationError("unsupported model provider", provider="unknown")
+    model_name = settings.model_name
+    if provider != "mock" and model_name == "promptfirewall-mock-1":
+        model_name = DEFAULT_MODEL_NAMES.get(provider, "")
+    if not model_name.strip():
+        raise AdapterConfigurationError("model name is required", provider=provider)
+    base_url = settings.model_base_url
+    if provider != "mock":
+        base_url = base_url if base_url is not None else DEFAULT_BASE_URLS.get(provider)
+        try:
+            url = httpx.URL(base_url or "")
+            valid_url = url.scheme in {"http", "https"} and bool(url.host)
+        except httpx.InvalidURL:
+            valid_url = False
+        if not valid_url:
+            raise AdapterConfigurationError("valid model base URL is required", provider=provider)
+        if settings.model_api_key is None or not settings.model_api_key.get_secret_value().strip():
+            raise AdapterConfigurationError("model API key is required", provider=provider)
+    return settings.model_copy(
+        deep=True,
+        update={"model_provider": provider, "model_name": model_name, "model_base_url": base_url},
     )
 
 
