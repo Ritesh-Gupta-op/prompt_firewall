@@ -168,7 +168,10 @@ class MetricsCalculator:
         self.confidence = confidence
 
     def calculate(self, records: Iterable[Any]) -> MetricsSnapshot:
-        observations = tuple(_observation(record) for record in records)
+        observations = tuple(
+            _observation(record) for record in records
+            if _enum_value(_field(record, "status")) not in {"queued", "running", "cancelled"}
+        )
         attack = tuple(item for item in observations if item.case_kind == "attack")
         benign = tuple(item for item in observations if item.case_kind == "benign")
         attack_eligible = tuple(

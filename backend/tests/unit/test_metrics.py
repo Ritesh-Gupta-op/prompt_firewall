@@ -77,3 +77,14 @@ def test_metrics_report_empty_eligible_sets_without_inventing_rates() -> None:
     assert metrics.error_rate.value == 0.0
     assert metrics.median_latency_ms is None
     assert metrics.p95_latency_ms is None
+
+
+def test_pending_and_cancelled_runs_are_not_completed_execution_observations() -> None:
+    metrics = calculate_metrics([
+        {"status": "cancelled", "error": {"type": "CancellationRequested"}, "latency_ms": 3},
+        {"status": "running", "latency_ms": 1},
+        {"status": "queued"},
+    ])
+    assert metrics.error_rate.denominator == 0
+    assert metrics.error_rate.value is None
+    assert metrics.median_latency_ms is None
