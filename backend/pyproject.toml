@@ -48,6 +48,9 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["promptfirewall"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true

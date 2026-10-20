@@ -13,11 +13,13 @@ backend/.env
 *.log
 .DS_Store
 .env
+.env.*
 !.env.example
 .victim-sandbox/
 *.egg-info/
 build/
 dist/
 .verify-venv/
+.repro-check/
 *.db
 *.sqlite3

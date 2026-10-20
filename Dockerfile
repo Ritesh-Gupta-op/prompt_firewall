@@ -1,12 +1,17 @@
-FROM python:3.11.2-slim-bullseye AS builder
+FROM python:3.11.2-slim-bullseye@sha256:2f749ef90f54fd4b3c77cde78eec23ab5b8199d9ac84e4ced6ae523ef223ef7b AS builder
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /build
 COPY requirements-dev.lock ./
 RUN python -m pip install --no-cache-dir --only-binary=:all: --require-hashes -r requirements-dev.lock
 COPY backend ./backend
+COPY scripts ./scripts
+COPY .python-version Dockerfile requirements.lock .env.example ./
 RUN python -m build --wheel --no-isolation --outdir /wheels backend
 
-FROM python:3.11.2-slim-bullseye AS runtime
+FROM builder AS test
+CMD ["python", "-m", "pytest", "-c", "backend/pyproject.toml", "backend/tests", "-q"]
+
+FROM python:3.11.2-slim-bullseye@sha256:2f749ef90f54fd4b3c77cde78eec23ab5b8199d9ac84e4ced6ae523ef223ef7b AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PROMPTFIREWALL_DATABASE_URL=sqlite+aiosqlite:////data/promptfirewall.db
 WORKDIR /app

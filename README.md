@@ -29,19 +29,32 @@ and [limitations](docs/KNOWN_LIMITATIONS.md).
 
 ## Reproducible setup
 
-Linux, Python **3.11.2** (`.python-version`), and GNU Make are the verified local
-toolchain. Install into the project; no global packages are needed. Runtime and
-development dependencies are fully pinned with hashes in `requirements.lock`
-and `requirements-dev.lock`.
+Run the commands below from the repository root. A clean Linux machine needs
+**either** Docker Engine with the Compose plugin **or** Python **3.11.2** with
+`venv`/`ensurepip` support and GNU Make. Docker is the self-contained path when
+the host does not already have the exact Python version; no host Python, compiler,
+database server, or global Python packages are needed for that path.
+
+Both Docker base images pin Python 3.11.2 and its multi-platform image digest.
+Runtime and development dependencies are pinned with SHA-256 hashes in
+`requirements.lock` and `requirements-dev.lock`. The Linux images install binary
+wheels only, so no unlisted compiler/system-package build dependencies are used.
+
+### Local Python setup
 
 ```bash
-python3.11 -m venv .venv
-.venv/bin/python -m pip install --require-hashes -r requirements-dev.lock
-.venv/bin/python -m pip install --no-deps --no-build-isolation -e backend
+make setup
 ```
 
+`make setup` verifies `.python-version`, creates a project-local `.venv`, installs
+the hash-locked dependencies, and installs the backend without resolving more
+dependencies. It fails clearly on a different Python patch version or incompatible
+existing virtualenv and does not delete it. If Python 3.11.2 is available under a
+different executable name, use `make setup BOOTSTRAP_PYTHON=python`.
+
 No environment file or credentials are needed for the default mock. `.env.example`
-documents optional configuration; private `.env` files are ignored by Git and Docker.
+documents every setting. Private `.env` and `.env.*` files are ignored by Git and
+Docker; `.env.example` contains placeholders only and remains checked in.
 After dependencies are installed, tests and wheel builds work offline.
 
 ## Checks and build
@@ -59,12 +72,30 @@ this maintenance operation requires package-index access.
 
 ## Run and deploy
 
-```bash
-make dev-backend
-# Local API: http://localhost:8000; schema: /openapi.json; documentation: /docs
+Local Python, after `make setup`:
 
-docker compose up --build -d
+```bash
+make run
+# Local API: http://localhost:8000; schema: /openapi.json; documentation: /docs
+```
+
+`make dev-backend` is the optional auto-reloading development command. `make run`
+uses one process without reload and binds only to loopback.
+
+### Docker-only clean Linux build, test, and run
+
+These commands need Docker, not a local Python installation. Initial image builds
+need network access to the image registry and package index. The built test image
+runs the same pytest suite with networking disabled.
+
+```bash
+docker compose build
+docker build --target test -t promptfirewall:test .
+docker run --rm --network none promptfirewall:test
+docker compose up -d
 docker compose ps
+# Stop without deleting the database volume:
+docker compose down
 ```
 
 Compose binds **127.0.0.1:8000**, persists SQLite in a named volume, and allows
@@ -83,6 +114,8 @@ Only SQLite/single-process operation is verified. Do not run multiple Uvicorn
 processes against the same job database: startup recovery assumes exclusive
 process ownership. Docker execution and live providers must be verified in their
 target environment; see the status document for checks actually run locally.
+The rebuild audit and clean-source verification are in
+[`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md).
 
 ## Backend interface
 

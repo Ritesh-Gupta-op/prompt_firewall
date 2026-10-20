@@ -13,15 +13,15 @@ setup:
 	$(BOOTSTRAP_PYTHON) scripts/bootstrap.py
 
 lint:
-	$(PYTHON) -m ruff check backend/src backend/tests
+	$(PYTHON) -m ruff check --config backend/pyproject.toml backend/src backend/tests scripts
 
 typecheck:
-	$(PYTHON) -m mypy --config-file backend/pyproject.toml backend/src
+	$(PYTHON) -m mypy --config-file backend/pyproject.toml backend/src scripts
 
 check: test lint typecheck
 
 format:
-	$(PYTHON) -m ruff format backend/src backend/tests
+	$(PYTHON) -m ruff format --config backend/pyproject.toml backend/src backend/tests scripts
 
 run:
 	$(PYTHON) -m uvicorn promptfirewall.main:app --app-dir backend/src --host 127.0.0.1 --port 8000

@@ -14,11 +14,12 @@ jobs:
           python-version-file: .python-version
           cache: pip
           cache-dependency-path: requirements-dev.lock
-      - run: python -m pip install --require-hashes -r requirements-dev.lock
-      - run: python -m pip install --no-deps --no-build-isolation -e backend
-      - run: make check PYTHON=python
-      - run: make build PYTHON=python
-      - run: python -m pip check
+      - run: make setup BOOTSTRAP_PYTHON=python
+      - run: make check
+      - run: make build
+      - run: .venv/bin/python -m pip check
+      - run: docker build --target test -t promptfirewall:test .
+      - run: docker run --rm --network none promptfirewall:test
       - run: docker build -t promptfirewall:ci .
       - name: Container health and firewall smoke test
         run: |

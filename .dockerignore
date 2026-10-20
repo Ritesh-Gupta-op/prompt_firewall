@@ -1,6 +1,8 @@
 .git
 .venv
 .verify-venv
+.repro-check
+**/.venv
 **/__pycache__
 **/.pytest_cache
 **/.ruff_cache
@@ -8,10 +10,17 @@
 .coverage
 .env
 **/.env
+.env.*
+**/.env.*
+!.env.example
 *.db
 *.sqlite3
+**/*.db
+**/*.db-*
+**/*.sqlite3
 .victim-sandbox
 dist
 **/build
 **/*.egg-info
 *.log
+**/*.log
